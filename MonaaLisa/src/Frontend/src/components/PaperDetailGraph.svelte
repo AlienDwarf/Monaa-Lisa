@@ -187,62 +187,125 @@
     const SPREAD_ITERS = 40;
     const REPEL_STRENGTH = 0.5;
 
+    // Spread nur bis zu dieser Knotenzahl, darüber UMAP-Koordinaten unverändert.
+    const SPREAD_MAX_NODES = 10000;
+
+    // Abstoßung zu naher Knoten. Statt alle Paare zu vergleichen (O(n²)),
+    // kommen die Knoten in ein Raster mit Zellgröße MIN_DIST: zwei Knoten
+    // können nur zu nah sein, wenn sie in derselben oder einer Nachbarzelle
+    // liegen → ~O(n) pro Iteration. Gerechnet wird auf Typed Arrays, ins
+    // Graph-Objekt wird erst am Ende geschrieben. Das Zentrum bleibt fix.
     function applySpread(g: GraphLib) {
         const nodes = g.nodes();
-        if (nodes.length < 2) return;
+        const N = nodes.length;
+        if (N < 2 || N > SPREAD_MAX_NODES) return;
         const centerNode = paper.entry_id;
 
+        const xs = new Float64Array(N);
+        const ys = new Float64Array(N);
+        const fixed = new Uint8Array(N);
+        for (let i = 0; i < N; i++) {
+            xs[i] = g.getNodeAttribute(nodes[i], "x");
+            ys[i] = g.getNodeAttribute(nodes[i], "y");
+            fixed[i] = nodes[i] === centerNode ? 1 : 0;
+        }
+
+        const cellSize = MIN_DIST;
+        const cellX = new Int32Array(N);
+        const cellY = new Int32Array(N);
+        const next = new Int32Array(N); // verkettete Liste pro Zelle
+        // Halbe Nachbarschaft: jedes Zellpaar wird genau einmal besucht.
+        const NEIGHBOURS: [number, number][] = [
+            [1, 0],
+            [-1, 1],
+            [0, 1],
+            [1, 1],
+        ];
+
+        const pushApart = (i: number, j: number) => {
+            const dx = xs[j] - xs[i];
+            const dy = ys[j] - ys[i];
+            const dist = Math.sqrt(dx * dx + dy * dy) || 0.01;
+            if (dist < MIN_DIST) {
+                const push = ((MIN_DIST - dist) / 2) * REPEL_STRENGTH;
+                const ux = (dx / dist) * push;
+                const uy = (dy / dist) * push;
+                // Don't move the center node
+                if (!fixed[i]) {
+                    xs[i] -= ux;
+                    ys[i] -= uy;
+                }
+                if (!fixed[j]) {
+                    xs[j] += ux;
+                    ys[j] += uy;
+                }
+            }
+        };
+
         for (let iter = 0; iter < SPREAD_ITERS; iter++) {
-            // Compute centroid (excluding center which stays at 0,0)
+            // Centroid + Rastergrenzen
             let cx = 0,
                 cy = 0;
-            nodes.forEach((n) => {
-                cx += g.getNodeAttribute(n, "x");
-                cy += g.getNodeAttribute(n, "y");
-            });
-            cx /= nodes.length;
-            cy /= nodes.length;
+            let minX = Infinity,
+                minY = Infinity,
+                maxX = -Infinity;
+            for (let i = 0; i < N; i++) {
+                cx += xs[i];
+                cy += ys[i];
+                if (xs[i] < minX) minX = xs[i];
+                if (ys[i] < minY) minY = ys[i];
+                if (xs[i] > maxX) maxX = xs[i];
+            }
+            cx /= N;
+            cy /= N;
+
+            // Raster neu aufbauen (Knoten haben sich bewegt)
+            const cols = Math.floor((maxX - minX) / cellSize) + 1;
+            const head = new Map<number, number>();
+            for (let i = 0; i < N; i++) {
+                const gx = Math.floor((xs[i] - minX) / cellSize);
+                const gy = Math.floor((ys[i] - minY) / cellSize);
+                cellX[i] = gx;
+                cellY[i] = gy;
+                const key = gy * cols + gx;
+                next[i] = head.get(key) ?? -1;
+                head.set(key, i);
+            }
 
             // Repel nodes that are too close
-            for (let i = 0; i < nodes.length; i++) {
-                let xi = g.getNodeAttribute(nodes[i], "x");
-                let yi = g.getNodeAttribute(nodes[i], "y");
-                for (let j = i + 1; j < nodes.length; j++) {
-                    let xj = g.getNodeAttribute(nodes[j], "x");
-                    let yj = g.getNodeAttribute(nodes[j], "y");
-                    const dx = xj - xi;
-                    const dy = yj - yi;
-                    const dist = Math.sqrt(dx * dx + dy * dy) || 0.01;
-                    if (dist < MIN_DIST) {
-                        const push = ((MIN_DIST - dist) / 2) * REPEL_STRENGTH;
-                        const ux = (dx / dist) * push;
-                        const uy = (dy / dist) * push;
-                        // Don't move the center node
-                        if (nodes[i] !== centerNode) {
-                            g.setNodeAttribute(nodes[i], "x", xi - ux);
-                            g.setNodeAttribute(nodes[i], "y", yi - uy);
-                        }
-                        if (nodes[j] !== centerNode) {
-                            g.setNodeAttribute(nodes[j], "x", xj + ux);
-                            g.setNodeAttribute(nodes[j], "y", yj + uy);
-                        }
+            for (let i = 0; i < N; i++) {
+                const gx = cellX[i];
+                const gy = cellY[i];
+                for (let j = head.get(gy * cols + gx) ?? -1; j !== -1; j = next[j]) {
+                    if (j > i) pushApart(i, j);
+                }
+                for (const [ox, oy] of NEIGHBOURS) {
+                    const nx = gx + ox;
+                    if (nx < 0 || nx >= cols) continue;
+                    const key = (gy + oy) * cols + nx;
+                    for (let j = head.get(key) ?? -1; j !== -1; j = next[j]) {
+                        pushApart(i, j);
                     }
                 }
             }
 
             // Clamp nodes that drifted beyond MAX_DIST from centroid (skip center)
-            nodes.forEach((n) => {
-                if (n === centerNode) return;
-                let x = g.getNodeAttribute(n, "x");
-                let y = g.getNodeAttribute(n, "y");
-                const dx = x - cx;
-                const dy = y - cy;
+            for (let i = 0; i < N; i++) {
+                if (fixed[i]) continue;
+                const dx = xs[i] - cx;
+                const dy = ys[i] - cy;
                 const d = Math.sqrt(dx * dx + dy * dy);
                 if (d > MAX_DIST) {
-                    g.setNodeAttribute(n, "x", cx + (dx / d) * MAX_DIST);
-                    g.setNodeAttribute(n, "y", cy + (dy / d) * MAX_DIST);
+                    xs[i] = cx + (dx / d) * MAX_DIST;
+                    ys[i] = cy + (dy / d) * MAX_DIST;
                 }
-            });
+            }
+        }
+
+        for (let i = 0; i < N; i++) {
+            if (fixed[i]) continue;
+            g.setNodeAttribute(nodes[i], "x", xs[i]);
+            g.setNodeAttribute(nodes[i], "y", ys[i]);
         }
     }
 

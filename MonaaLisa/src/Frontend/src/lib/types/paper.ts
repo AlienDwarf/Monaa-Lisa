@@ -43,6 +43,29 @@ export interface Paper {
     tsne1: number;
     tsne2: number;
     cluster: string;
+    /**
+     * arXiv-interne Zitationszahl. Bei Papern aus GET /papers/points gesetzt,
+     * deren `citations`-Liste noch leer ist (Details noch nicht geladen).
+     */
+    arxiv_citation_count?: number;
+    /**
+     * false = nur Punktdaten (ID, Koordinaten, Zitationszahlen) vorhanden;
+     * Titel, Autoren, Abstract usw. müssen über /papers/:id nachgeladen werden.
+     */
+    detailsLoaded?: boolean;
+}
+
+/**
+ * Spaltenorientierte Antwort von GET /papers/points.
+ */
+export interface CategoryPointsResponse {
+    category: string;
+    count: number;
+    ids: string[];
+    x: number[];
+    y: number[];
+    cc: number[];
+    nc: number[];
 }
 
 /**

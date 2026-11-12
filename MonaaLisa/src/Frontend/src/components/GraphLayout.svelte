@@ -30,6 +30,7 @@
         ViewState,
         PaperSession,
     } from "$lib/types/paper";
+    import { fetchCategoryPoints, normalizePaper } from "../utils/paperApi";
     import { env as publicEnv } from "$env/dynamic/public";
     import clusterData from "../utils/arxiv_cluster_data.json";
     import {
@@ -395,7 +396,7 @@
                     view = { level: "sub", parentName: pName, parentId: pid };
                     papers = [];
                     error = null;
-                    loadSamplePapers("sub", pid);
+                    loadSamplePapers({ parentId: pid });
                 },
             });
         }
@@ -446,7 +447,7 @@
             };
             papers = [];
             error = null;
-            loadSamplePapers("sub", e.detail.id);
+            loadSamplePapers({ parentId: e.detail.id });
         });
     }
 
@@ -596,8 +597,13 @@
     async function handleRestoreSession(e: CustomEvent<PaperSession>) {
         const session = e.detail;
         // Try to find the paper in the currently loaded set first (fast path)
+        // (Punkte aus /papers/points haben noch keine Details → nicht verwenden)
         let paper: Paper | null =
-            papers.find((p) => p.entry_id === session.mainPaper.entry_id) ??
+            papers.find(
+                (p) =>
+                    p.entry_id === session.mainPaper.entry_id &&
+                    p.detailsLoaded !== false,
+            ) ??
             sidebarSamplePapers.find(
                 (p) => p.entry_id === session.mainPaper.entry_id,
             ) ??
@@ -611,7 +617,7 @@
                 );
                 if (res.ok) {
                     const raw: ApiPaper = await res.json();
-                    paper = normalizePaper(raw, 0, 1);
+                    paper = normalizePaper(raw, 0);
                 }
             } catch {
                 /* fall through */
@@ -632,7 +638,7 @@
                     const found = rawItems.find(
                         (p) => p.entry_id === session.mainPaper.entry_id,
                     );
-                    if (found) paper = normalizePaper(found, 0, 1);
+                    if (found) paper = normalizePaper(found, 0);
                 }
             } catch {
                 /* ignore */
@@ -666,62 +672,71 @@
     }
 
     // ─── data loading ─────────────────────────────────────────────────
-    // Fetches papers for a specific subcategory from the NestJS backend.
-    // Papers are stored in the `papers` array which Graph.svelte reads reactively.
+    // Lädt die Punktwolke (ID, UMAP-Koordinaten, Zitationszahlen) einer
+    // Kategorie über GET /papers/points. Details (Titel, Abstract, …) lädt
+    // Graph.svelte erst bei Hover/Klick nach. Paper-Limit 0 = ganze Kategorie.
+    // Ein neuer Aufruf bricht den vorherigen ab, damit eine langsame ältere
+    // Antwort nicht die Daten einer später gewählten Kategorie überschreibt.
+    let papersAbort: AbortController | null = null;
+
     async function loadPapers(categoryId: string) {
+        papersAbort?.abort();
+        const ctrl = new AbortController();
+        papersAbort = ctrl;
+
         loading = true;
         error = null;
         papers = [];
         // Clear stale search highlights whenever a new category is loaded.
         searchHighlightPapers = [];
+        // Sidebar zeigt die meistzitierten Paper mit vollen Details
+        loadSamplePapers({ category: categoryId });
         try {
-            // Build URL: filter by category, apply optional cap, sort by citation count
-            const url = `${API_BASE_URL}/papers?categories=${encodeURIComponent(categoryId)}${paperLimit > 0 ? `&take=${paperLimit}` : ""}&skip=0&sort=citations`;
-            const response = await fetch(url);
-            if (!response.ok) throw new Error(`Backend ${response.status}`);
-
-            const payload = (await response.json()) as
-                | Partial<PapersResponse>
-                | ApiPaper[];
-            const rawItems = Array.isArray(payload)
-                ? payload
-                : (payload?.items ?? []);
-
-            papers = rawItems
-                .map((item, i, a) =>
-                    normalizePaper(item as ApiPaper, i, a.length),
-                )
-                .filter((p): p is Paper => Boolean(p));
-
-            // sidebar shows all the loaded papers in papers-level view
-            sidebarSamplePapers = papers;
-
+            const loaded = await fetchCategoryPoints(
+                API_BASE_URL,
+                categoryId,
+                paperLimit > 0 ? paperLimit : undefined,
+                ctrl.signal,
+            );
+            if (ctrl.signal.aborted) return;
+            papers = loaded;
             if (!papers.length)
                 error = "Keine Papers für diese Kategorie gefunden.";
         } catch (err) {
+            if (ctrl.signal.aborted) return;
             error = err instanceof Error ? err.message : "Fehler beim Laden.";
             papers = [];
         } finally {
-            loading = false;
+            if (papersAbort === ctrl) {
+                loading = false;
+                papersAbort = null;
+            }
         }
     }
 
     /**
-     * Load a sample of papers for the sidebar in top / sub cluster views.
-     * @param level  'top' or 'sub'
-     * @param parentId  cluster id (for sub level); unused at top level
+     * Load a sample of the most cited papers (full objects) for the sidebar.
+     * - `parentId`: top-level cluster id → category prefix (e.g. "cs.")
+     * - `category`: exact subcategory (papers view)
      */
-    async function loadSamplePapers(level: "top" | "sub", parentId?: string) {
+    let sampleAbort: AbortController | null = null;
+
+    async function loadSamplePapers(opts: {
+        parentId?: string;
+        category?: string;
+    } = {}) {
+        sampleAbort?.abort();
+        const ctrl = new AbortController();
+        sampleAbort = ctrl;
         try {
-            let categoryParam = "";
-            if (parentId) {
-                const prefix = CLUSTER_CAT_PREFIX[parentId] ?? "";
-                categoryParam = prefix
-                    ? `&categories=${encodeURIComponent(prefix)}`
-                    : "";
-            }
+            const cat =
+                opts.category ??
+                (opts.parentId ? (CLUSTER_CAT_PREFIX[opts.parentId] ?? "") : "");
+            const categoryParam = cat
+                ? `&categories=${encodeURIComponent(cat)}`
+                : "";
             const url = `${API_BASE_URL}/papers?take=${SIDEBAR_SAMPLE}&skip=0&sort=citations${categoryParam}`;
-            const res = await fetch(url);
+            const res = await fetch(url, { signal: ctrl.signal });
             if (!res.ok) return;
             const payload = (await res.json()) as
                 | Partial<PapersResponse>
@@ -729,89 +744,13 @@
             const rawItems = Array.isArray(payload)
                 ? payload
                 : (payload?.items ?? []);
+            if (ctrl.signal.aborted) return;
             sidebarSamplePapers = rawItems
-                .map((item, i, a) =>
-                    normalizePaper(item as ApiPaper, i, a.length),
-                )
+                .map((item, i) => normalizePaper(item as ApiPaper, i))
                 .filter((p): p is Paper => Boolean(p));
         } catch {
-            sidebarSamplePapers = [];
+            if (!ctrl.signal.aborted) sidebarSamplePapers = [];
         }
-    }
-
-    // ─── paper normalisation (carried over) ───────────────────────────
-    function parseTsne(tsne: unknown): [number, number] {
-        if (!tsne) return [0, 0];
-        let obj: any = tsne;
-        if (typeof obj === "string") {
-            try {
-                obj = JSON.parse(obj);
-            } catch {
-                return [0, 0];
-            }
-        }
-        if (
-            obj &&
-            typeof obj === "object" &&
-            typeof obj.x === "number" &&
-            typeof obj.y === "number"
-        ) {
-            return [obj.x, obj.y];
-        }
-        return [0, 0];
-    }
-
-    function normalizePaper(
-        raw: ApiPaper,
-        index: number,
-        total: number,
-    ): Paper | null {
-        if (!raw?.entry_id || !raw?.title) return null;
-        const [t1, t2] = parseTsne(raw.tsne);
-        console.log(`Normalized paper ${raw.entry_id} (${index + 1}/${total}) with t-SNE (${t1.toFixed(2)}, ${t2.toFixed(2)})`);
-        return {
-            id: Number(raw.id ?? index),
-            entry_id: raw.entry_id,
-            title: raw.title,
-            authors: formatAuthors(raw.authors),
-            abstract: raw.abstract ?? "",
-            published: raw.published ?? null,
-            categories: raw.categories ?? null,
-            url: raw.url ?? null,
-            citations: deriveStringArray(raw.citations),
-            references: deriveStringArray(raw.references),
-            non_arxiv_citation_count: raw.non_arxiv_citation_count ?? 0,
-            non_arxiv_reference_count: raw.non_arxiv_reference_count ?? 0,
-            tsne1: t1,
-            tsne2: t2,
-            cluster: raw.categories ?? "U",
-        };
-    }
-
-    function formatAuthors(a: ApiPaper["authors"]): string {
-        if (!a) return "";
-        return Array.isArray(a) ? a.join(", ") : a;
-    }
-
-    function deriveStringArray(value: unknown): string[] {
-        if (!value) return [];
-        if (Array.isArray(value)) {
-            return value
-                .map((item) => {
-                    if (typeof item === "string") return item;
-                    if (typeof item === "number") return item.toString();
-                    if (item && typeof item === "object" && "entry_id" in item)
-                        return (item as any).entry_id ?? "";
-                    return "";
-                })
-                .filter(Boolean);
-        }
-        if (typeof value === "string")
-            return value
-                .split(",")
-                .map((s) => s.trim())
-                .filter(Boolean);
-        return [];
     }
 
     // ─── load initial sample papers for top-level sidebar ────────────  // sidebar label: human-readable name for the current view level
@@ -1105,7 +1044,7 @@
         {:else}
             <!-- Category sidebar with paper list -->
             <Sidebar
-                papers={view.level === "papers" ? papers : sidebarSamplePapers}
+                papers={sidebarSamplePapers}
                 isOpen={sidebarOpen}
                 {dashboardOpen}
                 {selectedPaperId}
