@@ -22,8 +22,14 @@ from dotenv import load_dotenv
 
 from config import cfg
 from util.logger import Logger
-from Database.db import is_database_empty, engine
-from Database.db_models import db_base
+from Database.db import (
+    DATASET_IMPORT_COMPLETE,
+    DATASET_IMPORT_KEY,
+    engine,
+    is_database_empty,
+    is_dataset_import_complete,
+    set_app_state,
+)
 from SemanticPaper.api.semantic_scholar import SemanticScholarAPI
 from SemanticPaper.api.arxiv import ArxivAPI
 from SemanticPaper.data.downloader import (
@@ -73,10 +79,24 @@ def main():
         sys.exit(1)
 
     # ---- 2. First-run: download & import ----
-    first_run = is_database_empty()
-    if first_run:
-        logger.info("First run detected – database is empty.")
-        logger.info("Downloading dataset and pre-trained models from Google Drive...")
+    # Maßgeblich ist der gespeicherte Import-Status, nicht "Tabelle nicht leer":
+    # Ein abgebrochener Import wird so beim nächsten Start fortgesetzt
+    # (der Import ist idempotent – vorhandene Zeilen werden per Upsert überschrieben).
+    # Ein Fehler bei der Prüfung beendet das Programm, statt fälschlich
+    # einen kompletten Neu-Import auszulösen.
+    try:
+        import_complete = is_dataset_import_complete()
+        db_empty = is_database_empty()
+    except Exception as e:
+        logger.error(f"Could not determine import state (did Prisma migrations run?): {e}")
+        sys.exit(1)
+
+    if not import_complete:
+        if db_empty:
+            logger.info("First run detected – database is empty.")
+        else:
+            logger.warning("Previous dataset import did not finish – resuming import.")
+        logger.info("Downloading dataset and pre-trained models...")
 
         if not ensure_all_downloaded():
             logger.error("Failed to download required files. Exiting.")
@@ -90,6 +110,7 @@ def main():
             logger.error("Dataset import failed. Exiting.")
             sys.exit(1)
 
+        set_app_state(DATASET_IMPORT_KEY, DATASET_IMPORT_COMPLETE)
         logger.info("Dataset imported successfully. Cleaning up raw file...")
         cleanup_dataset()
     else:

@@ -8,6 +8,7 @@ from unittest.mock import Mock, MagicMock, patch
 sys.modules.setdefault("Database.db", MagicMock())
 
 from MonaaLisa.src.SemanticPaper.pipeline.incremental import (
+    _categories_of,
     _fetch_new_arxiv_papers,
     _normalize_entry_id,
     run_incremental_update,
@@ -152,6 +153,45 @@ class TestFetchNewArxivPapers:
         mock_logger.error.assert_called_once()
 
 
+def _s2_found(arxiv_id="2401.00001", **extra):
+    """One 'found' item as returned by SemanticScholarAPI.fetch_batch_detailed()."""
+    item = {"arxiv_id": arxiv_id, "embedding_768d": [0.1] * 768,
+            "s2_id": "s2_123", "non_arxiv_citation_count": 5,
+            "non_arxiv_reference_count": 3,
+            "citation_arxiv_ids": [], "reference_arxiv_ids": []}
+    item.update(extra)
+    return item
+
+
+def _uncaught(entry_id, **fields):
+    u = Mock()
+    u.entry_id = entry_id
+    u.title = fields.get("title", "Test")
+    u.authors = fields.get("authors", "Author")
+    u.abstract = fields.get("abstract", "Abstract")
+    u.categories = fields.get("categories", "cs.AI")
+    u.published = fields.get("published", datetime(2024, 1, 1))
+    u.url = fields.get("url", f"http://arxiv.org/pdf/{entry_id}")
+    return u
+
+
+class TestCategoriesOf:
+    """All categories are stored, primary category first."""
+
+    def test_primary_first_then_others_without_duplicates(self):
+        r = _make_arxiv_result(primary_category="cs.LG")
+        r.categories = ["stat.ML", "cs.LG", "cs.AI"]
+        assert _categories_of(r) == "cs.LG stat.ML cs.AI"
+
+    def test_only_primary(self):
+        r = _make_arxiv_result(primary_category="hep-ph")
+        r.categories = None
+        assert _categories_of(r) == "hep-ph"
+
+    def test_none_result(self):
+        assert _categories_of(None) is None
+
+
 class TestRunIncrementalUpdate:
     """Tests branching logic inside run_incremental_update()."""
 
@@ -161,368 +201,288 @@ class TestRunIncrementalUpdate:
     @patch(f"{MODULE}.get_newest_paper_date", return_value=None)
     @patch(f"{MODULE}.logger")
     def test_returns_early_when_db_is_empty(self, mock_logger, mock_newest, mock_count):
-        """
-        Tests: if newest_date is None: ... return
-
-        An empty database means the initial import hasn't run yet.
-        Without this guard, the pipeline would query arXiv with
-        since=None and crash.
-        """
+        """An empty database means the initial import hasn't run yet."""
         run_incremental_update(Mock(), Mock(), Mock())
 
-        # A warning is the only thing that should happen – no API calls, no exceptions
         mock_logger.warning.assert_called_once()
-        # get_paper_count sits AFTER the early return, so it must not have been reached
         mock_count.assert_not_called()
 
-    # _fetch_new_arxiv_papers returns [] to simulate "arXiv has nothing new"
     @patch(f"{MODULE}._fetch_new_arxiv_papers", return_value=[])
     @patch(f"{MODULE}.get_paper_count", return_value=100)
     @patch(f"{MODULE}.get_newest_paper_date", return_value=datetime(2024, 1, 1))
     @patch(f"{MODULE}.logger")
     def test_returns_early_when_no_new_arxiv_papers(self, mock_logger, mock_newest,
                                                      mock_count, mock_fetch):
-        """
-        Tests: if not raw_results: ... return
-
-        When arXiv has nothing new, the pipeline must exit cleanly
-        without touching SemanticScholar or the DB.
-        """
+        """When arXiv has nothing new, SemanticScholar must not be called."""
         s2_client = Mock()
 
         run_incremental_update(Mock(), s2_client, Mock())
 
-        # SemanticScholar should never be called when there's nothing to process
-        s2_client.fetch_batch.assert_not_called()
+        s2_client.fetch_batch_detailed.assert_not_called()
 
-    # arXiv returns papers, but paper_exists_by_id always returns True → all are duplicates.
-    # This covers the case where arXiv returns results, but after deduplication nothing is left.
-    @patch(f"{MODULE}.paper_exists_by_id", return_value=True)
+    @patch(f"{MODULE}.get_known_entry_ids", return_value={"2401.00001"})
     @patch(f"{MODULE}._fetch_new_arxiv_papers")
     @patch(f"{MODULE}.get_paper_count", return_value=100)
     @patch(f"{MODULE}.get_newest_paper_date", return_value=datetime(2024, 1, 1))
     @patch(f"{MODULE}.logger")
-    def test_returns_early_when_all_papers_already_in_db(self, mock_logger, mock_newest,
+    def test_returns_early_when_all_papers_already_known(self, mock_logger, mock_newest,
                                                           mock_count, mock_fetch,
-                                                          mock_exists):
-        """
-        Tests: if not new_papers: ... return
-
-        After dedup, if every fetched paper already exists in the DB,
-        we must not call SemanticScholar.  Without this check we'd
-        waste API quota on papers we already have.
-        """
+                                                          mock_known):
+        """If every fetched paper is already known, SemanticScholar must not be called."""
         mock_fetch.return_value = [_make_arxiv_result()]
 
         s2_client = Mock()
         run_incremental_update(Mock(), s2_client, Mock())
 
-        s2_client.fetch_batch.assert_not_called()
+        s2_client.fetch_batch_detailed.assert_not_called()
 
-   # The next two tests cover the "if found:" branch: success vs failure of save_processed_paper
-
-    @patch(f"{MODULE}.save_uncaught_paper")
-    # save_processed_paper returns True → paper saved successfully
-    @patch(f"{MODULE}.save_processed_paper", return_value=True)
+    @patch(f"{MODULE}.save_uncaught_papers")
+    @patch(f"{MODULE}.save_processed_papers", return_value={"2401.00001"})
     @patch(f"{MODULE}.cfg")
-    @patch(f"{MODULE}.paper_exists_by_id", return_value=False)
+    @patch(f"{MODULE}.get_known_entry_ids", return_value=set())
     @patch(f"{MODULE}._fetch_new_arxiv_papers")
     @patch(f"{MODULE}.get_paper_count", return_value=100)
     @patch(f"{MODULE}.get_newest_paper_date", return_value=datetime(2024, 1, 1))
     @patch(f"{MODULE}.logger")
     def test_processes_found_papers_through_pipeline(self, mock_logger, mock_newest,
                                                       mock_count, mock_fetch,
-                                                      mock_exists, mock_cfg,
+                                                      mock_known, mock_cfg,
                                                       mock_save, mock_save_uncaught):
-        """
-        Tests: if found: ... pipeline.batch_process(vectors_768)
+        """Found papers go through PCA+UMAP and are saved with metadata and coordinates."""
+        result = _make_arxiv_result(entry_id="http://arxiv.org/abs/2401.00001v1",
+                                    primary_category="cs.LG")
+        result.categories = ["cs.LG", "stat.ML"]
+        mock_fetch.return_value = [result]
+        mock_cfg.get_int.return_value = 100
 
-        Papers that SemanticScholar returns embeddings for must be
-        processed through PCA+UMAP and saved to the main tables.
-        """
-        mock_fetch.return_value = [_make_arxiv_result(entry_id="http://arxiv.org/abs/2401.00001v1")]
-        mock_cfg.get_int.return_value = 400
-
-        # SemanticScholar "finds" the paper and returns an embedding
         s2_client = Mock()
-        s2_client.fetch_batch.return_value = (
-            [{"arxiv_id": "2401.00001", "embedding_768d": [0.1] * 768,
-              "s2_id": "s2_123", "non_arxiv_citation_count": 5,
-              "non_arxiv_reference_count": 3,
-              "citation_arxiv_ids": [], "reference_arxiv_ids": []}],
-            [],  # not_found is empty
-        )
+        s2_client.fetch_batch_detailed.return_value = ([_s2_found()], [], [])
 
-        # Pipeline mock returns a reduced 128-D embedding + 2-D coordinates
         pipeline = Mock()
         pipeline.batch_process.return_value = [([0.1] * 128, (1.0, 2.0))]
 
         run_incremental_update(Mock(), s2_client, pipeline)
 
-        # The embedding must go through the pipeline, and the result must be saved
         pipeline.batch_process.assert_called_once()
         mock_save.assert_called_once()
+        records = mock_save.call_args[0][0]
+        assert len(records) == 1
+        rec = records[0]
+        assert rec["entry_id"] == "2401.00001"
+        assert rec["title"] == "Test Paper"
+        assert rec["categories"] == "cs.LG stat.ML"
+        assert (rec["tsne_x"], rec["tsne_y"]) == (1.0, 2.0)
+        assert rec["s2_id"] == "s2_123"
+        mock_save_uncaught.assert_not_called()
 
-    @patch(f"{MODULE}.save_uncaught_paper")
-    # save_processed_paper returns False → simulates a DB write failure
-    @patch(f"{MODULE}.save_processed_paper", return_value=False)
+    @patch(f"{MODULE}.save_uncaught_papers")
+    # save fails for the only paper → it must not get lost
+    @patch(f"{MODULE}.save_processed_papers", return_value=set())
     @patch(f"{MODULE}.cfg")
-    @patch(f"{MODULE}.paper_exists_by_id", return_value=False)
+    @patch(f"{MODULE}.get_known_entry_ids", return_value=set())
     @patch(f"{MODULE}._fetch_new_arxiv_papers")
     @patch(f"{MODULE}.get_paper_count", return_value=100)
     @patch(f"{MODULE}.get_newest_paper_date", return_value=datetime(2024, 1, 1))
     @patch(f"{MODULE}.logger")
-    def test_logs_warning_when_save_fails(self, mock_logger, mock_newest,
+    def test_unsaved_papers_go_to_uncaught(self, mock_logger, mock_newest,
                                            mock_count, mock_fetch,
-                                           mock_exists, mock_cfg,
+                                           mock_known, mock_cfg,
                                            mock_save, mock_save_uncaught):
-        """
-        Tests: if ok: processed_count += 1 / else: logger.warning(...)
-
-        When save_processed_paper returns False, the failure must be
-        logged so operators can investigate.
-        """
+        """A DB write failure is logged and the paper is kept in uncaught_paper."""
         mock_fetch.return_value = [_make_arxiv_result(entry_id="http://arxiv.org/abs/2401.00001v1")]
-        mock_cfg.get_int.return_value = 400
+        mock_cfg.get_int.return_value = 100
 
-        # SemanticScholar returns data, but the DB save will fail (mocked above)
         s2_client = Mock()
-        s2_client.fetch_batch.return_value = (
-            [{"arxiv_id": "2401.00001", "embedding_768d": [0.1] * 768,
-              "s2_id": "s2_123"}],
-            [],
-        )
+        s2_client.fetch_batch_detailed.return_value = ([_s2_found()], [], [])
 
         pipeline = Mock()
         pipeline.batch_process.return_value = [([0.1] * 128, (1.0, 2.0))]
 
         run_incremental_update(Mock(), s2_client, pipeline)
 
-        # save returned False → a warning about the failed paper must be logged
         mock_logger.warning.assert_called()
+        rows = mock_save_uncaught.call_args[0][0]
+        assert [r["entry_id"] for r in rows] == ["2401.00001"]
 
-   # This test covers the "for arxiv_id in not_found:" loop
-
-    @patch(f"{MODULE}.save_uncaught_paper")
+    @patch(f"{MODULE}.save_uncaught_papers")
     @patch(f"{MODULE}.cfg")
-    @patch(f"{MODULE}.paper_exists_by_id", return_value=False)
+    @patch(f"{MODULE}.get_known_entry_ids", return_value=set())
     @patch(f"{MODULE}._fetch_new_arxiv_papers")
     @patch(f"{MODULE}.get_paper_count", return_value=100)
     @patch(f"{MODULE}.get_newest_paper_date", return_value=datetime(2024, 1, 1))
     @patch(f"{MODULE}.logger")
-    def test_saves_not_found_papers_as_uncaught(self, mock_logger, mock_newest,
-                                                 mock_count, mock_fetch,
-                                                 mock_exists, mock_cfg,
-                                                 mock_save_uncaught):
-        """
-        Tests: for arxiv_id in not_found: save_uncaught_paper(...)
-
-        Papers that SemanticScholar doesn't know about yet must be
-        saved to uncaught_paper so the retry loop can pick them up later.
-        """
-        r1 = _make_arxiv_result(entry_id="http://arxiv.org/abs/2401.00001v1")
-        r2 = _make_arxiv_result(entry_id="http://arxiv.org/abs/2401.00002v1")
+    def test_saves_not_found_and_failed_papers_as_uncaught(self, mock_logger, mock_newest,
+                                                           mock_count, mock_fetch,
+                                                           mock_known, mock_cfg,
+                                                           mock_save_uncaught):
+        """Unknown to S2 and request failures both end up in uncaught_paper (one batch insert)."""
+        r1 = _make_arxiv_result(entry_id="http://arxiv.org/abs/2401.00001v1", title="One")
+        r2 = _make_arxiv_result(entry_id="http://arxiv.org/abs/2401.00002v1", title="Two")
         mock_fetch.return_value = [r1, r2]
         mock_cfg.get_int.return_value = 4
 
-        # SemanticScholar doesn't know either paper
         s2_client = Mock()
-        s2_client.fetch_batch.return_value = (
-            [],                                  # found is empty
-            ["2401.00001", "2401.00002"],         # both papers are not_found
-        )
+        s2_client.fetch_batch_detailed.return_value = ([], ["2401.00001"], ["2401.00002"])
 
         pipeline = Mock()
 
         run_incremental_update(Mock(), s2_client, pipeline)
 
-        # Both papers should be saved to the uncaught table
-        assert mock_save_uncaught.call_count == 2
-        # Pipeline should NOT have been called – there are no embeddings to process
+        mock_save_uncaught.assert_called_once()
+        rows = {r["entry_id"]: r for r in mock_save_uncaught.call_args[0][0]}
+        assert set(rows) == {"2401.00001", "2401.00002"}
+        assert rows["2401.00001"]["title"] == "One"   # metadata is kept for later
+        assert rows["2401.00002"]["max_retries"] == 4
         pipeline.batch_process.assert_not_called()
 
-   # This test covers the dedup filter: if not paper_exists_by_id(eid)
-
-    # paper_exists_by_id is given a side_effect so we can control per-paper results
-    @patch(f"{MODULE}.paper_exists_by_id")
+    @patch(f"{MODULE}.save_uncaught_papers")
+    @patch(f"{MODULE}.get_known_entry_ids", return_value={"2401.00002"})
     @patch(f"{MODULE}._fetch_new_arxiv_papers")
     @patch(f"{MODULE}.get_paper_count", return_value=100)
     @patch(f"{MODULE}.get_newest_paper_date", return_value=datetime(2024, 1, 1))
     @patch(f"{MODULE}.logger")
-    def test_dedup_filters_existing_papers(self, mock_logger, mock_newest,
-                                            mock_count, mock_fetch,
-                                            mock_exists):
-        """
-        Tests: if not paper_exists_by_id(eid): new_papers.append(...)
-
-        The dedup loop must skip papers that already exist in the DB.
-        Without this filter we'd create duplicates.
-        """
+    def test_dedup_filters_known_papers_with_one_query(self, mock_logger, mock_newest,
+                                                       mock_count, mock_fetch,
+                                                       mock_known, mock_save_uncaught):
+        """Known papers are skipped, and the DB is asked once for all IDs (no N+1)."""
         r1 = _make_arxiv_result(entry_id="http://arxiv.org/abs/2401.00001v1")
         r2 = _make_arxiv_result(entry_id="http://arxiv.org/abs/2401.00002v1")
-        r3 = _make_arxiv_result(entry_id="http://arxiv.org/abs/2401.00003v1")
+        r3 = _make_arxiv_result(entry_id="http://arxiv.org/abs/2401.00003v2")
         mock_fetch.return_value = [r1, r2, r3]
 
-        # Paper 1: new, Paper 2: already exists, Paper 3: new
-        mock_exists.side_effect = [False, True, False]
-
         s2_client = Mock()
-        s2_client.fetch_batch.return_value = ([], [])
+        s2_client.fetch_batch_detailed.return_value = ([], [], [])
 
-        with patch(f"{MODULE}.cfg") as mock_cfg, \
-             patch(f"{MODULE}.save_uncaught_paper"):
-            mock_cfg.get_int.return_value = 400
+        with patch(f"{MODULE}.cfg") as mock_cfg:
+            mock_cfg.get_int.return_value = 100
             run_incremental_update(Mock(), s2_client, Mock())
 
-        # fetch_batch should receive only the 2 new IDs; the duplicate must be filtered out
-        called_ids = s2_client.fetch_batch.call_args[0][0]
-        assert len(called_ids) == 2
-        assert "2401.00002" not in called_ids  # the existing paper was skipped
+        mock_known.assert_called_once()
+        assert sorted(mock_known.call_args[0][0]) == ["2401.00001", "2401.00002", "2401.00003"]
+        called_ids = s2_client.fetch_batch_detailed.call_args[0][0]
+        assert called_ids == ["2401.00001", "2401.00003"]
+
+    @patch(f"{MODULE}.save_uncaught_papers")
+    @patch(f"{MODULE}.save_processed_papers", side_effect=lambda recs: {r["entry_id"] for r in recs})
+    @patch(f"{MODULE}.cfg")
+    @patch(f"{MODULE}.get_known_entry_ids", return_value=set())
+    @patch(f"{MODULE}._fetch_new_arxiv_papers")
+    @patch(f"{MODULE}.get_paper_count", return_value=100)
+    @patch(f"{MODULE}.get_newest_paper_date", return_value=datetime(2024, 1, 1))
+    @patch(f"{MODULE}.logger")
+    def test_processes_and_saves_batch_by_batch(self, mock_logger, mock_newest,
+                                                mock_count, mock_fetch,
+                                                mock_known, mock_cfg,
+                                                mock_save, mock_save_uncaught):
+        """With batch size 2 and 3 papers, S2 is asked twice and each batch is saved separately."""
+        mock_fetch.return_value = [
+            _make_arxiv_result(entry_id=f"http://arxiv.org/abs/2401.0000{i}v1") for i in (1, 2, 3)
+        ]
+        mock_cfg.get_int.return_value = 2
+
+        s2_client = Mock()
+        s2_client.fetch_batch_detailed.side_effect = lambda ids, batch_size: (
+            [_s2_found(i) for i in ids], [], []
+        )
+        pipeline = Mock()
+        pipeline.batch_process.side_effect = lambda vecs: [([0.0] * 128, (0.0, 0.0))] * len(vecs)
+
+        run_incremental_update(Mock(), s2_client, pipeline)
+
+        assert s2_client.fetch_batch_detailed.call_count == 2
+        assert mock_save.call_count == 2
+        assert [len(c[0][0]) for c in mock_save.call_args_list] == [2, 1]
 
 
 class TestRetryUncaughtPapers:
     """Tests branching logic inside retry_uncaught_papers()."""
 
-    @patch(f"{MODULE}.purge_expired_uncaught")
-    # get_uncaught_papers_due returns [] to simulate "nothing is due for retry"
     @patch(f"{MODULE}.get_uncaught_papers_due", return_value=[])
     @patch(f"{MODULE}.cfg")
     @patch(f"{MODULE}.logger")
-    def test_returns_early_when_no_papers_due(self, mock_logger, mock_cfg,
-                                               mock_due, mock_purge):
-        """
-        Tests: if not due: ... return
-
-        When there are no uncaught papers due for retry, the function
-        must exit without calling SemanticScholar.
-        """
+    def test_returns_early_when_no_papers_due(self, mock_logger, mock_cfg, mock_due):
+        """Nothing due → SemanticScholar must not be called."""
         mock_cfg.get_int.return_value = 14
 
         s2_client = Mock()
         retry_uncaught_papers(s2_client, Mock())
 
-        # SemanticScholar should never be called when there's nothing to retry
-        s2_client.fetch_batch.assert_not_called()
+        s2_client.fetch_batch_detailed.assert_not_called()
 
-   # The next two tests cover "if ok: delete_uncaught_paper" – True vs False branch
-
-    @patch(f"{MODULE}.purge_expired_uncaught")
-    @patch(f"{MODULE}.delete_uncaught_paper")
-    # save_processed_paper returns True → paper rescued successfully
-    @patch(f"{MODULE}.save_processed_paper", return_value=True)
+    @patch(f"{MODULE}.count_parked_uncaught", return_value=0)
+    @patch(f"{MODULE}.increment_uncaught_retries")
+    @patch(f"{MODULE}.delete_uncaught_papers")
+    @patch(f"{MODULE}.save_processed_papers", return_value={"2401.00001"})
     @patch(f"{MODULE}.get_uncaught_papers_due")
     @patch(f"{MODULE}.cfg")
     @patch(f"{MODULE}.logger")
     def test_rescues_found_papers_and_deletes_from_uncaught(self, mock_logger, mock_cfg,
                                                              mock_due, mock_save,
-                                                             mock_delete, mock_purge):
-        """
-        Tests: if ok: delete_uncaught_paper(arxiv_id)
+                                                             mock_delete, mock_increment,
+                                                             mock_parked):
+        """A paper S2 now knows is saved with its stored metadata and removed from uncaught."""
+        mock_due.return_value = [_uncaught("2401.00001", title="Stored title")]
+        mock_cfg.get_int.return_value = 100
 
-        When a previously uncaught paper is now found on SemanticScholar,
-        it must be saved to the main tables AND removed from the uncaught table.
-        """
-        # Build a fake uncaught paper with all fields the function reads
-        uncaught = Mock()
-        uncaught.entry_id = "2401.00001"
-        uncaught.title = "Test"
-        uncaught.authors = "Author"
-        uncaught.abstract = "Abstract"
-        uncaught.categories = "cs.AI"
-        uncaught.published = datetime(2024, 1, 1)
-        uncaught.url = "http://arxiv.org/pdf/2401.00001"
-        mock_due.return_value = [uncaught]
-        mock_cfg.get_int.return_value = 400
-
-        # SemanticScholar now has data for this paper
         s2_client = Mock()
-        s2_client.fetch_batch.return_value = (
-            [{"arxiv_id": "2401.00001", "embedding_768d": [0.1] * 768,
-              "s2_id": "s2_123", "non_arxiv_citation_count": 5,
-              "non_arxiv_reference_count": 3,
-              "citation_arxiv_ids": [], "reference_arxiv_ids": []}],
-            [],  # not_found is empty
-        )
+        s2_client.fetch_batch_detailed.return_value = ([_s2_found()], [], [])
 
         pipeline = Mock()
         pipeline.batch_process.return_value = [([0.1] * 128, (1.0, 2.0))]
 
         retry_uncaught_papers(s2_client, pipeline)
 
-        # Paper must be saved to main tables AND removed from uncaught
         mock_save.assert_called_once()
-        mock_delete.assert_called_once_with("2401.00001")
+        assert mock_save.call_args[0][0][0]["title"] == "Stored title"
+        mock_delete.assert_called_once_with({"2401.00001"})
 
-    @patch(f"{MODULE}.purge_expired_uncaught")
-    @patch(f"{MODULE}.delete_uncaught_paper")
-    # save_processed_paper returns False → DB write failed
-    @patch(f"{MODULE}.save_processed_paper", return_value=False)
+    @patch(f"{MODULE}.count_parked_uncaught", return_value=0)
+    @patch(f"{MODULE}.increment_uncaught_retries")
+    @patch(f"{MODULE}.delete_uncaught_papers")
+    @patch(f"{MODULE}.save_processed_papers", return_value=set())
     @patch(f"{MODULE}.get_uncaught_papers_due")
     @patch(f"{MODULE}.cfg")
     @patch(f"{MODULE}.logger")
-    def test_does_not_delete_uncaught_when_save_fails(self, mock_logger, mock_cfg,
-                                                       mock_due, mock_save,
-                                                       mock_delete, mock_purge):
-        """
-        Tests: if ok: delete_uncaught_paper (False branch)
+    def test_does_not_delete_or_count_retry_when_save_fails(self, mock_logger, mock_cfg,
+                                                            mock_due, mock_save,
+                                                            mock_delete, mock_increment,
+                                                            mock_parked):
+        """If saving fails, the paper stays in uncaught and does not lose a retry."""
+        mock_due.return_value = [_uncaught("2401.00001")]
+        mock_cfg.get_int.return_value = 100
 
-        If save_processed_paper fails, the paper must remain in the
-        uncaught table so it can be retried on the next cycle.
-        """
-        uncaught = Mock()
-        uncaught.entry_id = "2401.00001"
-        mock_due.return_value = [uncaught]
-        mock_cfg.get_int.return_value = 400
-
-        # SemanticScholar has data, but the save will fail (mocked above)
         s2_client = Mock()
-        s2_client.fetch_batch.return_value = (
-            [{"arxiv_id": "2401.00001", "embedding_768d": [0.1] * 768}],
-            [],
-        )
+        s2_client.fetch_batch_detailed.return_value = ([_s2_found()], [], [])
 
         pipeline = Mock()
         pipeline.batch_process.return_value = [([0.1] * 128, (1.0, 2.0))]
 
         retry_uncaught_papers(s2_client, pipeline)
 
-        # save returned False → the paper must NOT be deleted from uncaught
-        mock_delete.assert_not_called()
+        deleted = mock_delete.call_args[0][0] if mock_delete.called else set()
+        assert "2401.00001" not in deleted
+        incremented = mock_increment.call_args[0][0] if mock_increment.called else []
+        assert "2401.00001" not in incremented
 
-    # This test covers the for arxiv_id in loop
-
-    @patch(f"{MODULE}.purge_expired_uncaught")
-    @patch(f"{MODULE}.increment_uncaught_retry")
+    @patch(f"{MODULE}.count_parked_uncaught", return_value=0)
+    @patch(f"{MODULE}.delete_uncaught_papers")
+    @patch(f"{MODULE}.increment_uncaught_retries")
     @patch(f"{MODULE}.get_uncaught_papers_due")
     @patch(f"{MODULE}.cfg")
     @patch(f"{MODULE}.logger")
-    def test_increments_retry_for_still_missing_papers(self, mock_logger, mock_cfg,
-                                                        mock_due, mock_increment,
-                                                        mock_purge):
+    def test_increments_retry_only_for_not_found(self, mock_logger, mock_cfg,
+                                                 mock_due, mock_increment,
+                                                 mock_delete, mock_parked):
         """
-        Tests: for arxiv_id in not_found: increment_uncaught_retry(arxiv_id)
-
-        Papers that SemanticScholar still doesn't know about must have
-        their retry counter incremented so they eventually get purged
-        after max_retries.
+        Still unknown to S2 → retry counter +1.
+        Request failed (rate limit / network) → NOT counted as a retry.
         """
-        uncaught1 = Mock(); uncaught1.entry_id = "2401.00001"
-        uncaught2 = Mock(); uncaught2.entry_id = "2401.00002"
-        mock_due.return_value = [uncaught1, uncaught2]
-        mock_cfg.get_int.return_value = 400
+        mock_due.return_value = [_uncaught("2401.00001"), _uncaught("2401.00002")]
+        mock_cfg.get_int.return_value = 100
 
-        # SemanticScholar still doesn't know about either paper
         s2_client = Mock()
-        s2_client.fetch_batch.return_value = (
-            [],                                  # found is empty
-            ["2401.00001", "2401.00002"],         # both still missing
-        )
+        s2_client.fetch_batch_detailed.return_value = ([], ["2401.00001"], ["2401.00002"])
 
-        pipeline = Mock()
-        retry_uncaught_papers(s2_client, pipeline)
+        retry_uncaught_papers(s2_client, Mock())
 
-        # Both papers must have their retry counter incremented
-        assert mock_increment.call_count == 2
-        mock_increment.assert_any_call("2401.00001")
-        mock_increment.assert_any_call("2401.00002")
-
+        mock_increment.assert_called_once_with(["2401.00001"])

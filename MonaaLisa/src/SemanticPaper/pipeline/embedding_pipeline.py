@@ -91,6 +91,9 @@ class EmbeddingPipeline:
 
         _log_memory_status("Before UMAP load")
 
+        # Muss vor der Speicherwarnung berechnet werden (wird dort ausgegeben)
+        umap_size_gb = self._umap_path.stat().st_size / (1024 ** 3)
+
         # Vorab-Check: Warnung, wenn verfügbarer Speicher kritisch niedrig ist
         avail_gb = _get_available_memory_gb()
         if avail_gb is not None and avail_gb < 2.0:
@@ -101,7 +104,6 @@ class EmbeddingPipeline:
             )
 
         logger.info(f"Loading UMAP model from {self._umap_path} ...")
-        umap_size_gb = self._umap_path.stat().st_size / (1024 ** 3)
         logger.info(f"UMAP file size: {umap_size_gb:.2f} GB – using mmap_mode='c' (copy-on-write) to reduce peak RAM")
         self._umap = joblib.load(self._umap_path, mmap_mode="c")
         logger.info(f"UMAP model loaded (type: {type(self._umap).__name__})")

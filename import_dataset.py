@@ -303,6 +303,51 @@ def flush_links(conn, table: str, cols: list[str], rows: list[tuple]):
     conn.commit()
 
 
+def refresh_derived_columns(conn):
+    """
+    Fills category_list / primary_category / arxiv_citation_count for all
+    papers (same logic as the Prisma migration category_list_and_citation_count).
+    Run once after the bulk import – one pass is much cheaper than keeping the
+    columns up to date row by row while importing millions of papers.
+    Skipped if the columns don't exist (schema not migrated by Prisma).
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT count(*) FROM information_schema.columns
+             WHERE table_name = 'paper'
+               AND column_name IN ('category_list', 'primary_category', 'arxiv_citation_count')
+        """)
+        if cur.fetchone()[0] < 3:
+            print("[warn] Derived columns missing (run `prisma migrate deploy` first) – skipping refresh.")
+            return
+        print("[derive] Updating category_list / primary_category / arxiv_citation_count ...")
+        t0 = time.time()
+        cur.execute("""
+            WITH cc AS (
+                SELECT belonging_paper_entry_id AS entry_id, COUNT(*)::int AS cnt
+                  FROM paper_citation
+                 GROUP BY belonging_paper_entry_id
+            ),
+            src AS (
+                SELECT p.id,
+                       NULLIF(btrim(regexp_replace(COALESCE(p.categories, ''), '[\\s,]+', ' ', 'g')), '') AS cats,
+                       COALESCE(cc.cnt, 0) AS cnt
+                  FROM paper p
+                  LEFT JOIN cc ON cc.entry_id = p.entry_id
+            )
+            UPDATE paper p
+               SET category_list        = CASE WHEN src.cats IS NULL THEN ARRAY[]::TEXT[]
+                                               ELSE string_to_array(src.cats, ' ') END,
+                   primary_category     = CASE WHEN src.cats IS NULL THEN NULL
+                                               ELSE split_part(src.cats, ' ', 1) END,
+                   arxiv_citation_count = src.cnt
+              FROM src
+             WHERE src.id = p.id
+        """)
+        print(f"[derive] {cur.rowcount:,} papers updated in {time.time() - t0:.1f}s")
+    conn.commit()
+
+
 # ---------------------------------------------------------------------------
 # Main import loop
 # ---------------------------------------------------------------------------
@@ -434,6 +479,8 @@ def import_dataset(filepath: str, batch_size: int = 20000):
     flush_embeddings(conn, embedding_batch)
     flush_links(conn, "paper_citation", PAPER_CITATION_COLS, citation_batch)
     flush_links(conn, "paper_reference", PAPER_REFERENCE_COLS, reference_batch)
+
+    refresh_derived_columns(conn)
 
     elapsed = time.time() - t0
     print(

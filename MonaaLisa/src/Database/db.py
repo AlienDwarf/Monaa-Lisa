@@ -1,28 +1,24 @@
 import os
+import re
 import sys
-from datetime import datetime, timezone
-from typing import cast, List
-from sqlalchemy import create_engine, or_, and_, exists, select, update
+from datetime import datetime, timedelta, timezone
+from sqlalchemy import case, create_engine, delete, func, select, text, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import sessionmaker
 from dotenv import load_dotenv
-from config import cfg
-from sqlalchemy.exc import ProgrammingError
-from Database.db_models import db_base, DBPaper, DBPaperRelation, DBEmbedding, ProgramRun, HistoricalCompletion, DBUncaughtPaper
-from object.paper import Paper
-from object.relation import Relation
+from Database.db_models import (
+    DBPaper, DBEmbedding, DBUncaughtPaper, DBPaperCitation, DBPaperReference,
+)
 from util.logger import Logger
 
-from object.embedding import Embedding
-# Imports für Typ-Prüfung bei Relationen
-from object.paper_reference import PaperReference
-from object.paper_citation import PaperCitation
-
-# os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".env")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 load_dotenv()
 
 logger = Logger("Database")
+
+# Placeholder title for papers whose arXiv metadata is unknown
+UNKNOWN_TITLE = "[Unknown]"
 
 # DATABASE_URL remains env-driven for Docker; do not move into config.ini
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -37,367 +33,6 @@ engine = create_engine(
 )
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, future=True)
 
-
-
-
-
-"""
-05-August-2025 - Lenio
-Abstract: Fetches all embeddings from the database and returns them as a dictionary.
-Returns: A dictionary where keys are paper entry IDs and values are Embedding objects.
-"""
-def get_all_embeddings():
-    session = SessionLocal()
-    try:
-        limit = cfg.get_int(
-            "semanticpaper",
-            "embeddings_preload_limit",
-            int(os.getenv("EMBEDDINGS_PRELOAD_LIMIT", "5000"))
-        )
-        q = session.query(DBEmbedding)
-        if limit > 0:
-            q = q.limit(limit)
-        try:
-            db_embeddings_rows = q.all()
-        except ProgrammingError as e:
-            logger.warning(f"Embeddings table missing or not initialized yet: {e}")
-            return {}
-        # Get rid of the warning in pycharm
-        db_embeddings = cast(List[DBEmbedding], db_embeddings_rows)
-        embedding_dict = {
-            db_embedding.belonging_paper_entry_id: Embedding.from_db(db_embedding)
-            for db_embedding in db_embeddings if db_embedding.content is not None
-        }
-        return embedding_dict
-    finally:
-        session.close()
-
-
-"""
-20-December-2025 - Basti - Refactor for the supervised UMAP
-Abstract: Returns a mapping of paper entry_id to its arXiv category for supervised reducers.
-Args:
-- limit: optional limit mirroring embedding preload limits to avoid excessive memory use
-Returns: Dict[str, str | None]
-"""
-def get_embedding_labels(limit: int | None = None) -> dict[str, str | None]:
-    session = SessionLocal()
-    try:
-        q = session.query(DBPaper.entry_id, DBPaper.categories).filter(DBPaper.categories.isnot(None))
-        if limit is not None:
-            q = q.limit(limit)
-        rows = q.all()
-        return {entry_id: categories for entry_id, categories in rows if entry_id}
-    except Exception as e:
-        logger.error(f"Failed to load embedding labels: {e}")
-        return {}
-    finally:
-        session.close()
-
-"""
-25-May-2025 - Basti
-Abstract: Saves one given arXiv paper into the Postgres database
-Args:
-- paper: The given arXiv paper
-Returns: bool -> True if: paper was successfully committed to the database | False if: commit failed/Exception occured
-21-August-2025 - Lenio
-Annotation: Removed redundant parameters hash and date, these should come from the paper object.
-"""
-
-def save_paper_to_db(paper: Paper):
-    session = SessionLocal()
-
-    # 1. Check if paper already exists (by entry_id)
-    if paper_exists(session, paper):
-        logger.info(f"Paper already exists in DB: {paper.title}")
-        session.close()
-        return True
-
-    try:
-        # 2. Check if paper exists as a Stub (by entry_id)
-        existing_paper = session.query(DBPaper).filter_by(entry_id=paper.entry_id).first()
-
-        if existing_paper:
-            logger.info(f"Updating existing stub/paper: {paper.title}")
-            existing_paper.title = paper.title
-            existing_paper.authors = ", ".join(paper.authors)
-            existing_paper.abstract = paper.abstract
-            existing_paper.published = paper.published
-            existing_paper.categories = paper.categories
-            existing_paper.tsne = json.dumps(paper.tsne) if paper.tsne else None
-            existing_paper.url = paper.url
-        else:
-            # Insert new paper
-            db_paper = paper.to_db_model()
-            session.add(db_paper)
-
-        # Flush to ensure the paper (or update) is applied before we add relations
-        session.flush()
-
-        # 3. Handle Missing Targets for Relations (Create Stubs)
-        # This ensures that referenced papers exist in the DB so Foreign Keys don't fail
-        references = paper.references if paper.references else []
-        citations = paper.citations if paper.citations else []
-
-        needed_ids = set()
-
-        # Collect IDs from PaperReference and PaperCitation objects
-        for ref in references:
-            if isinstance(ref, PaperReference):
-                needed_ids.add(ref.referenced_paper_id)
-
-        for cite in citations:
-            if isinstance(cite, PaperCitation):
-                needed_ids.add(cite.cited_paper_id)
-
-        if needed_ids:
-            # Find which ones are missing in DB
-            existing_stubs = session.query(DBPaper.entry_id).filter(DBPaper.entry_id.in_(needed_ids)).all()
-            found_ids = {r.entry_id for r in existing_stubs}
-
-            missing_ids = needed_ids - found_ids
-
-            if missing_ids:
-                logger.info(f"Creating {len(missing_ids)} stubs for missing relations...")
-                for mid in missing_ids:
-                    stub = DBPaper(
-                        entry_id=mid,
-                        title="[STUB] Pending Fetch",
-                    )
-                    session.add(stub)
-                session.flush()
-
-        # 4. Save Relations
-        for ref in references:
-            db_reference = ref.to_db_model()
-            session.add(db_reference)
-
-        for cite in citations:
-            db_citation = cite.to_db_model()
-            session.add(db_citation)
-
-        # 5. Handle Embedding
-        if paper.embedding is not None:
-            # Remove existing embedding if we are updating a stub/paper to avoid unique constraint violation
-            session.query(DBEmbedding).filter_by(belonging_paper_entry_id=paper.entry_id).delete()
-
-            db_embedding = paper.embedding.to_db_model()
-            logger.info(f"Adding embedding to DB for paper: {paper.title}")
-            session.add(db_embedding)
-
-        session.commit()
-        logger.info(f"Saved paper to DB: {paper.title}")
-        return True
-
-    except Exception as e:
-        logger.error(f"DB error: {e}")
-        session.rollback()
-        return False
-    finally:
-        session.close()
-
-"""
-20-August-2025 - Lenio & Reviewed by Nico
-Abstract: Saves a relation between two papers in the database.
-Args:
-PaperRelation: The relation object containing source_id, target_id, and confidence.
-"""
-def save_paper_relation(paper_relation: Relation):
-    session = SessionLocal()
-    try:
-        if not relation_exists(session, paper_relation.source_id, paper_relation.target_id):
-            db_paper_relation = paper_relation.to_db_model()
-            session.add(db_paper_relation)
-            session.commit()
-            logger.info(
-                f"Saved paper relation: {paper_relation.source_id} -> "
-                f"{paper_relation.target_id} with confidence {paper_relation.confidence}"
-            )
-            return True
-        else:
-            logger.info(
-                f"Relation already exists: {paper_relation.source_id} -> {paper_relation.target_id}"
-            )
-            return True
-    except Exception as e:
-        logger.error(f"DB error saving paper relation: {e}")
-        session.rollback()
-        return False
-    finally:
-        session.close()
-
-"""
-14-Dec 2025 - Basti
-Abstract: We can not "freeze" the papers location in the DB when we save them, because the t-SNE/UMAP projection
-may be calculated later. This function updates the projection field of a paper in the DB.
-Args:
-- entry_id: The entry_id of the paper to update
-- projection: The new projection dict to set
-Returns: bool -> True if update was successful, False otherwise
-"""
-def update_paper_projection(entry_id: str, projection: dict) -> bool:
-    session = SessionLocal()
-    try:
-        result = session.execute(
-            update(DBPaper)
-            .where(DBPaper.entry_id == entry_id)
-            .values(tsne=projection)
-        )
-        if result.rowcount == 0:
-            logger.warning(f"No paper found to update projection for entry_id={entry_id}")
-            session.rollback()
-            return False
-        session.commit()
-        logger.info(f"Updated projection for paper {entry_id}")
-        return True
-    except Exception as e:
-        logger.error(f"Failed updating projection for {entry_id}: {e}")
-        session.rollback()
-        return False
-    finally:
-        session.close()
-
-
-def get_entry_ids_missing_projection(limit: int | None = None) -> list[str]:
-    session = SessionLocal()
-    try:
-        query = session.query(DBPaper.entry_id).filter(DBPaper.tsne.is_(None))
-        if limit is not None:
-            query = query.limit(limit)
-        rows = query.all()
-        return [row[0] for row in rows if row[0] is not None]
-    except Exception as e:
-        logger.error(f"Failed to fetch papers missing projection: {e}")
-        return []
-    finally:
-        session.close()
-
-"""
-25-May-2025 - Basti - Tweaked 30-September-2025 - Lenio
-Abstract: Checks if a paper hash already exists in the database
-Args:
-- session: -> Current database session
-- paper: -> the paper object to check for
-Returns: bool -> True if: query of the paper is not Null/None | False if: query of the paper is None
-
-Tweak:
-Previously this only checked if the hash is saved into the database, now it checks via the unique entry_id of the paper.
-This is necessary because A) hash collisions are possible (though unlikely) and B) the entry_id is a unique field in the DB so it is more reliable.
-
-Additionally:
-Checking by hash could be a way of checking for updates to a paper, but that is not implemented yet.
-"""
-def paper_exists(session, paper: Paper):
-    return session.query(DBPaper).filter_by(entry_id=paper.entry_id).first() is not None
-
-
-""" 28.09. Nico
-    Prüft, ob eine Relation zwischen zwei Paper-IDs existiert, 
-    unabhängig von der Richtung (source_id ↔ target_id).
-
-    Hintergrund:
-    - Frühere Implementierung führte zwei separate SQL-Abfragen aus 
-      und lieferte vollständige Zeilen zurück.
-    - Diese Version kombiniert beide Bedingungen in einer Abfrage mit OR 
-      und nutzt `EXISTS`, um direkt ein Boolean-Ergebnis zu erzeugen.
-
-    SQL-Äquivalent:
-        SELECT EXISTS (
-            SELECT 1
-            FROM paper_relation
-            WHERE (source_id = :source_id AND target_id = :target_id)
-               OR (source_id = :target_id AND target_id = :source_id)
-        );
-    """
-def relation_exists(session, source_id: str, target_id: str):
-    # 29.09.25 Nico - Verbesserte Version der Abfrage. Aktuell werden 2 SQL Befehle ausgeführt (nicht effizient) dabei kann man das in einem Befehl mit OR kombinieren.
-    # Die Variante mit beiden Befehlen liefert auch die kompletten Zeilen obwohl man am Ende nur ein Boolean generieren möchte
-
-    # Check if the relation exists in either direction
-    sql_statement = select(exists().where(
-        or_(
-            and_(DBPaperRelation.source_id == source_id, DBPaperRelation.target_id == target_id),
-            and_(DBPaperRelation.source_id == target_id, DBPaperRelation.target_id == source_id),
-        )
-    ))
-    return bool(session.execute(sql_statement).scalar())
-
-"""
-13-August-2025 - Basti
-Abstract: Creates a new program run record and returns its ID.
-"""
-def create_program_run():
-    session = SessionLocal()
-    try:
-        session.query(ProgramRun).filter_by(is_active="true").update({"is_active": "false"})
-        run = ProgramRun(start_date=datetime.now(timezone.utc).replace(tzinfo=None), is_active="true")
-        session.add(run)
-        session.commit()
-        logger.info(f"Created ProgramRun ID: {run.id}")
-        return run.id
-    except Exception as e:
-        logger.error(f"Error creating program run: {e}")
-        session.rollback()
-        return None
-    finally:
-        session.close()
-
-
-"""
-20-December-2025 - Basti
-Abstract: Checks whether a program run exists.
-"""
-def program_run_exists(run_id: int) -> bool:
-    session = SessionLocal()
-    try:
-        return session.query(ProgramRun.id).filter_by(id=run_id).first() is not None
-    except Exception as e:
-        logger.error(f"Error checking program run existence: {e}")
-        return False
-    finally:
-        session.close()
-
-
-"""
-Abstract: Reactivates an existing program run and deactivates the others.
-Returns: bool -> True if the run was reactivated, False otherwise.
-"""
-def set_active_program_run(run_id: int) -> bool:
-    session = SessionLocal()
-    try:
-        if session.query(ProgramRun.id).filter_by(id=run_id).first() is None:
-            return False
-        session.query(ProgramRun).update({"is_active": "false"})
-        session.query(ProgramRun).filter_by(id=run_id).update({"is_active": "true"})
-        session.commit()
-        logger.info(f"Reactivated ProgramRun ID: {run_id}")
-        return True
-    except Exception as e:
-        logger.error(f"Error reactivating program run {run_id}: {e}")
-        session.rollback()
-        return False
-    finally:
-        session.close()
-
-"""
-13-August-2025 - Basti
-Abstract: Checks if a category is already completed historically in this run.
-"""
-def is_category_historically_completed(program_run_id, category):
-    session = SessionLocal()
-    try:
-        record = (
-            session.query(HistoricalCompletion)
-            .filter_by(program_run_id=program_run_id, category=category)
-            .filter(HistoricalCompletion.end_date.isnot(None))
-            .first()
-        )
-        return record is not None
-    except Exception as e:
-        logger.error(f"Error checking completion: {e}")
-        return False
-    finally:
-        session.close()
 
 """
 21-September-2025 - Basti
@@ -415,113 +50,6 @@ def _to_naive_utc(dt: datetime | None) -> datetime | None:
     except Exception:
         return dt
 
-"""
-13-August-2025 - Basti
-Abstract: Ensures a HistoricalCompletion start record exists for a category in this run.
-Optionally sets the goal oldest paper date.
-"""
-def ensure_historical_start(program_run_id, category, goal_oldest_paper_date: datetime | None = None):
-    session = SessionLocal()
-    try:
-        normalized_goal = _to_naive_utc(goal_oldest_paper_date)
-        record = (
-            session.query(HistoricalCompletion)
-            .filter_by(program_run_id=program_run_id, category=category)
-            .order_by(HistoricalCompletion.start_date.desc())
-            .first()
-        )
-        if record is None or record.end_date is not None:
-            new_rec = HistoricalCompletion(
-                program_run_id=program_run_id,
-                category=category,
-                start_date=datetime.now(),
-                goal_oldest_paper_date=normalized_goal,
-            )
-            session.add(new_rec)
-            session.commit()
-            logger.info(f"Started historical fetch for {category} in run {program_run_id}")
-        elif record.goal_oldest_paper_date is None and normalized_goal is not None:
-            record.goal_oldest_paper_date = normalized_goal
-            session.commit()
-        return True
-    except Exception as e:
-        logger.error(f"Error ensuring historical start: {e}")
-        session.rollback()
-        return False
-    finally:
-        session.close()
-
-"""
-13-August-2025 - Basti
-Abstract: Updates progress for a category's historical fetch with the current oldest fetched date.
-"""
-def update_historical_progress(program_run_id, category, oldest_seen_date: datetime | None):
-    session = SessionLocal()
-    try:
-        record = (
-            session.query(HistoricalCompletion)
-            .filter_by(program_run_id=program_run_id, category=category)
-            .order_by(HistoricalCompletion.start_date.desc())
-            .first()
-        )
-        if not record:
-            logger.error(f"No start entry to update for {category} in run {program_run_id}")
-            return False
-        # Keep storing any incidental progress-related state here in future if needed.
-        # Intentionally not toggling goal_reached anymore.
-        session.commit()
-        return True
-    except Exception as e:
-        logger.error(f"Error updating historical progress: {e}")
-        session.rollback()
-        return False
-    finally:
-        session.close()
-
-"""
-13-August-2025 - Basti
-Updated: 20-September-2025 - Align semantics
-Abstract: Marks a category as completed historically for this run.
-Behavior: Sets end_date and marks goal_reached = true with reached_date = now,
-          treating "goal" as completion of historical ingestion.
-"""
-def mark_category_historically_completed(program_run_id, category, oldest_seen_date=None):
-    session = SessionLocal()
-    try:
-        record = (
-            session.query(HistoricalCompletion)
-            .filter_by(program_run_id=program_run_id, category=category)
-            .order_by(HistoricalCompletion.start_date.desc())
-            .first()
-        )
-        if not record:
-            logger.error(f"No start entry to complete for {category} in run {program_run_id}")
-            return False
-        record.end_date = datetime.now(timezone.utc).replace(tzinfo=None)
-        if record.goal_reached != "true":
-            record.goal_reached = "true"
-            record.reached_date = datetime.now()
-        session.commit()
-        logger.info(f"Completed historical fetch for {category} in run {program_run_id}")
-        return True
-    except Exception as e:
-        logger.error(f"Error marking completion: {e}")
-        session.rollback()
-        return False
-    finally:
-        session.close()
-
-if __name__ == "__main__":
-    # Tabellen werden nur noch über Prisma gebaut nicht mehr über SQLAlchemy, daher ist dieser Schritt hier nicht mehr nötig.
-    #logger.info("Creating database tables...")
-    #db_base.metadata.create_all(bind=engine)
-    #logger.info("Tables created successfully!")
-    try:
-        with engine.connect() as conn:
-            logger.info("Connection to database successful.")
-    except Exception as e:
-        logger.error(f"Connection failed: {e}")
-
 
 # ---------------------------------------------------------------------------
 # New functions for the refactored pipeline – feb 2026 – Basti
@@ -529,19 +57,52 @@ if __name__ == "__main__":
 
 
 """
-Abstract: Checks whether the paper table is empty (first-run indicator).
+Abstract: Checks whether the paper table is empty.
 Returns: bool -> True if no papers exist in the DB.
+Raises on DB errors – a failed check must NOT be mistaken for "empty",
+otherwise a temporary DB problem would trigger a full re-download/re-import.
 """
 def is_database_empty() -> bool:
     session = SessionLocal()
     try:
-        count = session.query(DBPaper.id).limit(1).count()
-        return count == 0
-    except Exception as e:
-        logger.warning(f"Could not check database emptiness: {e}")
-        return True
+        return session.query(DBPaper.id).first() is None
     finally:
         session.close()
+
+
+DATASET_IMPORT_KEY = "dataset_import"
+DATASET_IMPORT_COMPLETE = "complete"
+
+
+"""
+Abstract: Reads a value from the app_state table (None if not set).
+Raises on DB errors (the caller decides how to react).
+"""
+def get_app_state(key: str) -> str | None:
+    with engine.connect() as conn:
+        row = conn.execute(text("SELECT value FROM app_state WHERE key = :k"), {"k": key}).first()
+        return row[0] if row else None
+
+
+"""
+Abstract: Sets a value in the app_state table (insert or update).
+"""
+def set_app_state(key: str, value: str) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO app_state (key, value, updated_at) VALUES (:k, :v, now())
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+            """),
+            {"k": key, "v": value},
+        )
+
+
+"""
+Abstract: True once the initial dataset import ran to the end.
+"""
+def is_dataset_import_complete() -> bool:
+    return get_app_state(DATASET_IMPORT_KEY) == DATASET_IMPORT_COMPLETE
 
 
 """
@@ -576,44 +137,11 @@ def get_paper_count() -> int:
 
 
 """
-Abstract: Saves a paper to the uncaught_paper table for later retry.
-Args:
-- entry_id, title, authors, abstract, categories, published, url
-Returns: bool
-"""
-def save_uncaught_paper(entry_id: str, title: str, authors: str | None = None,
-                        abstract: str | None = None, categories: str | None = None,
-                        published=None, url: str | None = None,
-                        max_retries: int = 4) -> bool:
-    session = SessionLocal()
-    try:
-        existing = session.query(DBUncaughtPaper).filter_by(entry_id=entry_id).first()
-        if existing:
-            return True
-        uncaught = DBUncaughtPaper(
-            entry_id=entry_id,
-            title=title,
-            authors=authors,
-            abstract=abstract,
-            categories=categories,
-            published=published,
-            url=url,
-            max_retries=max_retries,
-        )
-        session.add(uncaught)
-        session.commit()
-        return True
-    except Exception as e:
-        logger.error(f"Failed to save uncaught paper {entry_id}: {e}")
-        session.rollback()
-        return False
-    finally:
-        session.close()
-
-
-"""
 Abstract: Returns uncaught papers whose last_checked is older than the given
           interval (or was never checked), limited to those below max_retries.
+          Papers that reached max_retries stay in the table ("parked") and are
+          no longer returned – they are kept on purpose instead of being deleted,
+          so no paper silently disappears from the system.
 Args:
 - retry_interval_days: minimum days since last check
 Returns: list[DBUncaughtPaper]
@@ -621,8 +149,7 @@ Returns: list[DBUncaughtPaper]
 def get_uncaught_papers_due(retry_interval_days: int = 14) -> list:
     session = SessionLocal()
     try:
-        from sqlalchemy import func as sa_func
-        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - __import__("datetime").timedelta(days=retry_interval_days)
+        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=retry_interval_days)
         rows = (
             session.query(DBUncaughtPaper)
             .filter(DBUncaughtPaper.retry_count < DBUncaughtPaper.max_retries)
@@ -642,191 +169,296 @@ def get_uncaught_papers_due(retry_interval_days: int = 14) -> list:
 
 
 """
-Abstract: Increments the retry_count and sets last_checked for an uncaught paper.
-Args:
-- entry_id: the arXiv entry_id
-Returns: bool
+Abstract: Counts uncaught papers that exhausted their retries (kept, not retried).
+Returns: int
 """
-def increment_uncaught_retry(entry_id: str) -> bool:
+def count_parked_uncaught() -> int:
     session = SessionLocal()
     try:
-        row = session.query(DBUncaughtPaper).filter_by(entry_id=entry_id).first()
-        if not row:
-            return False
-        row.retry_count += 1
-        row.last_checked = datetime.now(timezone.utc).replace(tzinfo=None)
-        session.commit()
-        return True
-    except Exception as e:
-        logger.error(f"Failed to increment retry for {entry_id}: {e}")
-        session.rollback()
-        return False
-    finally:
-        session.close()
-
-
-"""
-Abstract: Removes an uncaught paper (either successfully processed or expired).
-Args:
-- entry_id: the arXiv entry_id
-Returns: bool
-"""
-def delete_uncaught_paper(entry_id: str) -> bool:
-    session = SessionLocal()
-    try:
-        session.query(DBUncaughtPaper).filter_by(entry_id=entry_id).delete()
-        session.commit()
-        return True
-    except Exception as e:
-        logger.error(f"Failed to delete uncaught paper {entry_id}: {e}")
-        session.rollback()
-        return False
-    finally:
-        session.close()
-
-
-"""
-Abstract: Drops uncaught papers whose retry_count >= max_retries.
-Returns: int -> number of expired entries removed
-"""
-def purge_expired_uncaught() -> int:
-    session = SessionLocal()
-    try:
-        count = (
-            session.query(DBUncaughtPaper)
+        return (
+            session.query(DBUncaughtPaper.id)
             .filter(DBUncaughtPaper.retry_count >= DBUncaughtPaper.max_retries)
-            .delete()
+            .count()
         )
-        session.commit()
-        logger.info(f"Purged {count} expired uncaught papers")
-        return count
     except Exception as e:
-        logger.error(f"Failed to purge expired uncaught papers: {e}")
-        session.rollback()
+        logger.error(f"Failed to count parked uncaught papers: {e}")
         return 0
     finally:
         session.close()
 
 
+# ---------------------------------------------------------------------------
+# Batch operations for the incremental pipeline (Nov 2026)
+#
+# Previously every paper needed several round trips (exists-check, insert,
+# one INSERT per citation link, ...). These functions handle a whole batch
+# in a single transaction and use INSERT ... ON CONFLICT, which also makes
+# concurrent jobs (incremental update + uncaught retry) safe.
+# ---------------------------------------------------------------------------
+
+_ID_CHUNK = 5000      # ids per IN/ANY query
+_LINK_CHUNK = 5000    # rows per multi-row INSERT for link tables
+
+
+def _chunks(items: list, size: int):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def split_categories(categories: str | None) -> list[str]:
+    """Splits a category string ("cs.LG stat.ML" or "cs.LG, stat.ML") into a list."""
+    if not categories:
+        return []
+    return [c for c in re.split(r"[\s,]+", categories.strip()) if c]
+
+
 """
-Abstract: Checks if a paper with the given entry_id exists in the paper table.
+Abstract: Returns the subset of the given entry_ids that already exist in the
+          paper table or in the uncaught_paper table (one query per 5000 ids).
+          Uncaught papers are handled by the retry job, so the incremental
+          update must not send them to SemanticScholar again.
 Args:
-- entry_id: str
+- entry_ids: list[str]
+Returns: set[str]
+"""
+def get_known_entry_ids(entry_ids: list[str]) -> set[str]:
+    known: set[str] = set()
+    if not entry_ids:
+        return known
+    unique_ids = list(dict.fromkeys(entry_ids))
+    with engine.connect() as conn:
+        for chunk in _chunks(unique_ids, _ID_CHUNK):
+            for table in (DBPaper.__table__, DBUncaughtPaper.__table__):
+                rows = conn.execute(
+                    select(table.c.entry_id).where(table.c.entry_id.in_(chunk))
+                )
+                known.update(r[0] for r in rows)
+    return known
+
+
+def _paper_upsert_stmt(rows: list[dict]):
+    t = DBPaper.__table__
+    stmt = pg_insert(t).values(rows)
+    ex = stmt.excluded
+    keep_if_null = [
+        "authors", "abstract", "categories", "published", "updated", "doi",
+        "journal_ref", "license", "url", "s2_id", "tsne", "primary_category",
+    ]
+    set_ = {col: func.coalesce(getattr(ex, col), t.c[col]) for col in keep_if_null}
+    # Placeholder title must not overwrite a real one
+    set_["title"] = case((ex.title == UNKNOWN_TITLE, t.c.title), else_=ex.title)
+    set_["category_list"] = case(
+        (func.cardinality(ex.category_list) > 0, ex.category_list),
+        else_=t.c.category_list,
+    )
+    set_["non_arxiv_citation_count"] = ex.non_arxiv_citation_count
+    set_["non_arxiv_reference_count"] = ex.non_arxiv_reference_count
+    return stmt.on_conflict_do_update(index_elements=[t.c.entry_id], set_=set_)
+
+
+def _insert_links(conn, table, rows: list[dict]):
+    for chunk in _chunks(rows, _LINK_CHUNK):
+        conn.execute(pg_insert(table).values(chunk).on_conflict_do_nothing())
+
+
+def _refresh_citation_counts(conn, entry_ids: list[str]):
+    for chunk in _chunks(list(dict.fromkeys(entry_ids)), _ID_CHUNK):
+        conn.execute(
+            text("""
+                UPDATE paper p
+                   SET arxiv_citation_count = sub.cnt
+                  FROM (SELECT belonging_paper_entry_id AS eid, COUNT(*)::int AS cnt
+                          FROM paper_citation
+                         WHERE belonging_paper_entry_id = ANY(:ids)
+                         GROUP BY belonging_paper_entry_id) sub
+                 WHERE p.entry_id = sub.eid
+            """),
+            {"ids": chunk},
+        )
+
+
+def _save_processed_batch(conn, records: list[dict]):
+    paper_rows = []
+    embedding_rows = []
+    citation_rows = []   # paper_citation(belonging = cited paper, cited_paper = citing paper)
+    reference_rows = []  # paper_reference(belonging = citing paper, referenced = cited paper)
+    touched_ids: list[str] = []
+
+    for r in records:
+        eid = r["entry_id"]
+        cats = split_categories(r.get("categories"))
+        tsne = None
+        if r.get("tsne_x") is not None and r.get("tsne_y") is not None:
+            # dict, NOT json.dumps: the JSON column serialises itself
+            tsne = {"x": float(r["tsne_x"]), "y": float(r["tsne_y"]), "method": "umap"}
+        paper_rows.append({
+            "entry_id": eid,
+            "title": r.get("title") or UNKNOWN_TITLE,
+            "authors": r.get("authors"),
+            "abstract": r.get("abstract"),
+            "categories": " ".join(cats) if cats else None,
+            "primary_category": cats[0] if cats else None,
+            "category_list": cats,
+            "published": _to_naive_utc(r.get("published")),
+            "updated": _to_naive_utc(r.get("updated")),
+            "doi": r.get("doi"),
+            "journal_ref": r.get("journal_ref"),
+            "license": r.get("license"),
+            "url": r.get("url"),
+            "s2_id": r.get("s2_id"),
+            "non_arxiv_citation_count": r.get("non_arxiv_citation_count"),
+            "non_arxiv_reference_count": r.get("non_arxiv_reference_count"),
+            "tsne": tsne,
+        })
+        if r.get("embedding_128d") is not None:
+            embedding_rows.append({
+                "belonging_paper_entry_id": eid,
+                "content": list(r["embedding_128d"]),
+            })
+
+        touched_ids.append(eid)
+        for cid in dict.fromkeys(r.get("citation_ids") or []):
+            # cid cites eid
+            citation_rows.append({"belonging_paper_entry_id": eid, "cited_paper_entry_id": cid})
+            reference_rows.append({"belonging_paper_entry_id": cid, "referenced_paper_entry_id": eid})
+        for rid in dict.fromkeys(r.get("reference_ids") or []):
+            # eid cites rid → rid gains a citation (keeps counts of older papers current)
+            reference_rows.append({"belonging_paper_entry_id": eid, "referenced_paper_entry_id": rid})
+            citation_rows.append({"belonging_paper_entry_id": rid, "cited_paper_entry_id": eid})
+            touched_ids.append(rid)
+
+    conn.execute(_paper_upsert_stmt(paper_rows))
+
+    if embedding_rows:
+        stmt = pg_insert(DBEmbedding.__table__).values(embedding_rows)
+        conn.execute(stmt.on_conflict_do_update(
+            index_elements=[DBEmbedding.__table__.c.belonging_paper_entry_id],
+            set_={"content": stmt.excluded.content},
+        ))
+
+    _insert_links(conn, DBPaperCitation.__table__, citation_rows)
+    _insert_links(conn, DBPaperReference.__table__, reference_rows)
+    _refresh_citation_counts(conn, touched_ids)
+
+
+"""
+Abstract: Saves fully processed papers (metadata + 128-D embedding + 2-D
+          coordinates + citation/reference links) in ONE transaction.
+          If the batch fails (e.g. one malformed record), it falls back to
+          saving paper by paper so a single bad record cannot sink the batch.
+Args:
+- records: list of dicts with keys entry_id, title, authors, abstract,
+  categories, published, updated, doi, journal_ref, license, url, s2_id,
+  non_arxiv_citation_count, non_arxiv_reference_count, embedding_128d,
+  tsne_x, tsne_y, citation_ids, reference_ids
+Returns: set[str] -> entry_ids that were saved
+"""
+def save_processed_papers(records: list[dict]) -> set[str]:
+    if not records:
+        return set()
+    try:
+        with engine.begin() as conn:
+            _save_processed_batch(conn, records)
+        return {r["entry_id"] for r in records}
+    except Exception as e:
+        logger.warning(f"Batch save of {len(records)} papers failed ({e}); retrying paper by paper",
+                       exc_info=False)
+
+    saved: set[str] = set()
+    for r in records:
+        try:
+            with engine.begin() as conn:
+                _save_processed_batch(conn, [r])
+            saved.add(r["entry_id"])
+        except Exception as e:
+            logger.error(f"Failed to save processed paper {r.get('entry_id')}: {e}")
+    return saved
+
+
+"""
+Abstract: Stores papers without SemanticScholar data for later retries.
+          Already known entries are left untouched (ON CONFLICT DO NOTHING).
+Args:
+- rows: list of dicts with keys entry_id, title, authors, abstract,
+  categories, published, url, max_retries
+Returns: int -> number of rows passed in (0 on error)
+"""
+def save_uncaught_papers(rows: list[dict]) -> int:
+    if not rows:
+        return 0
+    t = DBUncaughtPaper.__table__
+    values = [{
+        "entry_id": r["entry_id"],
+        "title": r.get("title"),
+        "authors": r.get("authors"),
+        "abstract": r.get("abstract"),
+        "categories": r.get("categories"),
+        "published": _to_naive_utc(r.get("published")),
+        "url": r.get("url"),
+        "retry_count": 0,
+        "max_retries": r.get("max_retries", 4),
+    } for r in rows]
+    try:
+        with engine.begin() as conn:
+            for chunk in _chunks(values, _LINK_CHUNK):
+                conn.execute(pg_insert(t).values(chunk).on_conflict_do_nothing(index_elements=[t.c.entry_id]))
+        return len(values)
+    except Exception as e:
+        logger.error(f"Failed to save {len(values)} uncaught papers: {e}")
+        return 0
+
+
+"""
+Abstract: Increments retry_count and sets last_checked for the given uncaught papers.
+Args:
+- entry_ids: list[str]
 Returns: bool
 """
-def paper_exists_by_id(entry_id: str) -> bool:
-    session = SessionLocal()
+def increment_uncaught_retries(entry_ids: list[str]) -> bool:
+    if not entry_ids:
+        return True
+    t = DBUncaughtPaper.__table__
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     try:
-        return session.query(DBPaper.id).filter_by(entry_id=entry_id).first() is not None
-    except Exception:
-        return False
-    finally:
-        session.close()
-
-
-"""
-Abstract: Saves a fully processed paper (with embedding + coordinates) to the DB.
-    Used by the incremental pipeline after SemanticScholar batch processing.
-Args:
-- entry_id, title, authors, abstract, categories, published, updated,
-  doi, journal_ref, license_val, url, s2_id,
-  non_arxiv_citation_count, non_arxiv_reference_count,
-  embedding_128d (list[float]), tsne_x (float), tsne_y (float),
-  citation_ids (list[str]), reference_ids (list[str])
-Returns: bool
-"""
-def save_processed_paper(entry_id: str, title: str, authors: str | None,
-                         abstract: str | None, categories: str | None,
-                         published=None, updated=None,
-                         doi: str | None = None, journal_ref: str | None = None,
-                         license_val: str | None = None, url: str | None = None,
-                         s2_id: str | None = None,
-                         non_arxiv_citation_count: int | None = None,
-                         non_arxiv_reference_count: int | None = None,
-                         embedding_128d: list | None = None,
-                         tsne_x: float | None = None, tsne_y: float | None = None,
-                         citation_ids: list[str] | None = None,
-                         reference_ids: list[str] | None = None) -> bool:
-    from Database.db_models import DBPaperCitation, DBPaperReference
-    from sqlalchemy.dialects.postgresql import insert as pg_insert
-    session = SessionLocal()
-    try:
-        tsne_val = None
-        if tsne_x is not None and tsne_y is not None:
-            import json
-            tsne_val = json.dumps({"x": tsne_x, "y": tsne_y, "method": "umap"})
-
-        existing = session.query(DBPaper).filter_by(entry_id=entry_id).first()
-        if existing:
-            existing.title = title or existing.title
-            existing.authors = authors or existing.authors
-            existing.abstract = abstract or existing.abstract
-            existing.categories = categories or existing.categories
-            existing.published = published or existing.published
-            existing.updated = updated or existing.updated
-            existing.doi = doi or existing.doi
-            existing.journal_ref = journal_ref or existing.journal_ref
-            existing.license = license_val or existing.license
-            existing.url = url or existing.url
-            existing.s2_id = s2_id or existing.s2_id
-            existing.non_arxiv_citation_count = non_arxiv_citation_count
-            existing.non_arxiv_reference_count = non_arxiv_reference_count
-            if tsne_val:
-                existing.tsne = tsne_val
-        else:
-            paper = DBPaper(
-                entry_id=entry_id,
-                title=title,
-                authors=authors,
-                abstract=abstract,
-                categories=categories,
-                published=published,
-                updated=updated,
-                doi=doi,
-                journal_ref=journal_ref,
-                license=license_val,
-                url=url,
-                s2_id=s2_id,
-                non_arxiv_citation_count=non_arxiv_citation_count,
-                non_arxiv_reference_count=non_arxiv_reference_count,
-                tsne=tsne_val,
-            )
-            session.add(paper)
-        session.flush()
-
-        # Embedding
-        if embedding_128d is not None:
-            session.query(DBEmbedding).filter_by(belonging_paper_entry_id=entry_id).delete()
-            session.add(DBEmbedding(
-                belonging_paper_entry_id=entry_id,
-                content=embedding_128d,
-            ))
-
-        # Citation links
-        for cid in (citation_ids or []):
-            try:
-                stmt = pg_insert(DBPaperCitation.__table__).values(
-                    belonging_paper_entry_id=entry_id, cited_paper_entry_id=cid
-                ).on_conflict_do_nothing()
-                session.execute(stmt)
-            except Exception:
-                pass
-
-        # Reference links
-        for rid in (reference_ids or []):
-            try:
-                stmt = pg_insert(DBPaperReference.__table__).values(
-                    belonging_paper_entry_id=entry_id, referenced_paper_entry_id=rid
-                ).on_conflict_do_nothing()
-                session.execute(stmt)
-            except Exception:
-                pass
-
-        session.commit()
+        with engine.begin() as conn:
+            for chunk in _chunks(list(entry_ids), _ID_CHUNK):
+                conn.execute(
+                    update(t).where(t.c.entry_id.in_(chunk))
+                    .values(retry_count=t.c.retry_count + 1, last_checked=now)
+                )
         return True
     except Exception as e:
-        logger.error(f"Failed to save processed paper {entry_id}: {e}")
-        session.rollback()
+        logger.error(f"Failed to increment retries for {len(entry_ids)} uncaught papers: {e}")
         return False
-    finally:
-        session.close()
+
+
+"""
+Abstract: Removes uncaught papers (after they were successfully processed).
+Args:
+- entry_ids: list[str] | set[str]
+Returns: bool
+"""
+def delete_uncaught_papers(entry_ids) -> bool:
+    entry_ids = list(entry_ids)
+    if not entry_ids:
+        return True
+    t = DBUncaughtPaper.__table__
+    try:
+        with engine.begin() as conn:
+            for chunk in _chunks(entry_ids, _ID_CHUNK):
+                conn.execute(delete(t).where(t.c.entry_id.in_(chunk)))
+        return True
+    except Exception as e:
+        logger.error(f"Failed to delete {len(entry_ids)} uncaught papers: {e}")
+        return False
+
+
+# Wird beim Container-Start als Verbindungstest ausgeführt (docker-compose: python Database/db.py).
+# Tabellen legt ausschließlich Prisma an (prisma migrate deploy).
+if __name__ == "__main__":
+    try:
+        with engine.connect() as conn:
+            logger.info("Connection to database successful.")
+    except Exception as e:
+        logger.error(f"Connection failed: {e}")
+        sys.exit(1)

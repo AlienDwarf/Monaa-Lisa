@@ -604,3 +604,77 @@ class TestCleanupDataset:
 
         cleanup_dataset()  # should not raise
 
+
+
+class TestAtomicDownloadAndChecksum:
+    """Incomplete downloads never look finished; sha256 from mirrors.json is enforced."""
+
+    @patch(f"{MOD}.requests.get")
+    def test_incomplete_download_leaves_no_destination_file(self, mock_get, tmp_dest):
+        from MonaaLisa.src.SemanticPaper.data.downloader import _download_http
+
+        resp = Mock()
+        resp.headers = {"content-length": "100"}
+        resp.iter_content.return_value = [b"x" * 60]  # connection dropped after 60 bytes
+        resp.raise_for_status = Mock()
+        mock_get.return_value = resp
+
+        assert _download_http("https://example.com/f", tmp_dest, "test") is False
+        assert not tmp_dest.exists()
+        assert not tmp_dest.with_name(tmp_dest.name + ".part").exists()
+
+    @patch(f"{MOD}.requests.get")
+    def test_crash_during_download_leaves_only_part_file(self, mock_get, tmp_dest):
+        from MonaaLisa.src.SemanticPaper.data.downloader import _download_http
+
+        def chunks():
+            yield b"x" * 10
+            raise KeyboardInterrupt  # simulates the process being killed mid-download
+
+        resp = Mock()
+        resp.headers = {"content-length": "100"}
+        resp.iter_content.return_value = chunks()
+        resp.raise_for_status = Mock()
+        mock_get.return_value = resp
+
+        with pytest.raises(KeyboardInterrupt):
+            _download_http("https://example.com/f", tmp_dest, "test")
+        assert not tmp_dest.exists()  # next start will download again
+
+    def test_existing_file_with_wrong_checksum_is_downloaded_again(self, tmp_path):
+        import hashlib
+        from MonaaLisa.src.SemanticPaper.data import downloader
+
+        good = b"good-content"
+        dest = tmp_path / "pca.pkl"
+        dest.write_bytes(b"tampered")
+        cfg_files = {"pca_model": {"filename": "pca.pkl", "description": "PCA",
+                                   "mirrors": ["https://m/pca.pkl"],
+                                   "sha256": hashlib.sha256(good).hexdigest()}}
+
+        def fake_http(url, d, desc):
+            d.write_bytes(good)
+            return True
+
+        with patch(f"{MOD}.FILES_CONFIG", cfg_files), \
+             patch(f"{MOD}._download_http", side_effect=fake_http) as mock_http:
+            assert downloader._download_file("pca_model", dest) is True
+        mock_http.assert_called_once()
+        assert dest.read_bytes() == good
+
+    def test_download_with_wrong_checksum_fails(self, tmp_path):
+        from MonaaLisa.src.SemanticPaper.data import downloader
+
+        dest = tmp_path / "pca.pkl"
+        cfg_files = {"pca_model": {"filename": "pca.pkl", "description": "PCA",
+                                   "mirrors": ["https://m/pca.pkl"], "sha256": "0" * 64}}
+
+        def fake_http(url, d, desc):
+            d.write_bytes(b"something else")
+            return True
+
+        with patch(f"{MOD}.FILES_CONFIG", cfg_files), \
+             patch(f"{MOD}._download_http", side_effect=fake_http), \
+             patch(f"{MOD}.time.sleep"):
+            assert downloader._download_file("pca_model", dest) is False
+        assert not dest.exists()

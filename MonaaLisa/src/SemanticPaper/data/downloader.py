@@ -1,5 +1,6 @@
 import os
 import json
+import hashlib
 import time
 from pathlib import Path
 from typing import Optional
@@ -50,6 +51,35 @@ def _models_dir() -> Path:
     return d
 
 
+def _part_path(dest: Path) -> Path:
+    """Temporary file used while downloading; renamed to `dest` only when complete."""
+    return dest.with_name(dest.name + ".part")
+
+
+def _sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _checksum_ok(path: Path, expected_sha256: str | None, description: str) -> bool:
+    """
+    Verifies the sha256 from mirrors.json (key "sha256"), if configured.
+    Important for the .pkl models: unpickling a manipulated file executes code.
+    """
+    if not expected_sha256:
+        logger.warning(f"No sha256 configured for {description} in mirrors.json – integrity not verified.")
+        return True
+    actual = _sha256(path)
+    if actual != expected_sha256:
+        logger.error(f"Checksum mismatch for {description}: expected {expected_sha256}, got {actual}")
+        return False
+    logger.info(f"Checksum OK for {description}")
+    return True
+
+
 def _get_file_config(file_key: str) -> dict:
     """Get configuration for a specific file from mirrors.json."""
     return FILES_CONFIG.get(file_key, {})
@@ -75,8 +105,11 @@ def _download_http(url: str, dest: Path, description: str) -> bool:
         total_size = int(response.headers.get('content-length', 0))
         downloaded = 0
         last_log_percent = -10
-        # streamed den Download in Chunks, damit wir große Dateien herunterladen können ohne zu viel RAM zu verbrauchen
-        with open(dest, 'wb') as f:
+        part = _part_path(dest)
+        # streamed den Download in Chunks, damit wir große Dateien herunterladen können ohne zu viel RAM zu verbrauchen.
+        # Geschrieben wird in eine .part-Datei, die erst nach vollständigem Download umbenannt wird –
+        # ein abgebrochener Download hinterlässt so nie eine Datei, die beim nächsten Start als "fertig" gilt.
+        with open(part, 'wb') as f:
             for chunk in response.iter_content(chunk_size=chunk_size):
                 if chunk:
                     f.write(chunk)
@@ -86,23 +119,26 @@ def _download_http(url: str, dest: Path, description: str) -> bool:
                         if percent >= last_log_percent + 10:
                             logger.info(f"  {description}: {percent}% ({downloaded / (1024**2):.1f} MB / {total_size / (1024**2):.1f} MB)")
                             last_log_percent = percent
-        # Nach dem Download prüfen wir, ob die Datei existiert und nicht leer ist, um sicherzustellen, dass der Download erfolgreich war
-        if dest.exists() and dest.stat().st_size > 0:
-            logger.info(f"Downloaded {description}: {dest.stat().st_size:,} bytes  {dest}")
-            return True
-        else:
-            # Wenn die Datei nicht existiert oder leer ist, behandeln wir das als Fehler, löschen die Datei (falls sie existiert) und loggen eine Fehlermeldung
+        size = part.stat().st_size if part.exists() else 0
+        if size == 0:
             logger.error(f"Download resulted in empty file: {dest}")
-            dest.unlink(missing_ok=True)
+            part.unlink(missing_ok=True)
             return False
-            
+        if total_size > 0 and size != total_size:
+            logger.error(f"Incomplete download of {description}: {size:,} of {total_size:,} bytes")
+            part.unlink(missing_ok=True)
+            return False
+        os.replace(part, dest)
+        logger.info(f"Downloaded {description}: {size:,} bytes  {dest}")
+        return True
+
     except requests.exceptions.RequestException as e:
         logger.warning(f"HTTP download failed for {description} from {url}: {e}")
-        dest.unlink(missing_ok=True)
+        _part_path(dest).unlink(missing_ok=True)
         return False
     except Exception as e:
         logger.error(f"Unexpected error downloading {description}: {e}")
-        dest.unlink(missing_ok=True)
+        _part_path(dest).unlink(missing_ok=True)
         return False
 
 """
@@ -124,8 +160,9 @@ def _download_gdrive(file_id: str, dest: Path, description: str, max_retries: in
     for attempt in range(1, max_retries + 1):
         logger.info(f"Downloading {description} from Google Drive (attempt {attempt}/{max_retries})...")
         try:
-            output = gdown.download(url, str(dest), quiet=False, fuzzy=True)
-            if output is None or not dest.exists():
+            part = _part_path(dest)
+            output = gdown.download(url, str(part), quiet=False, fuzzy=True)
+            if output is None or not part.exists():
                 logger.error(f"GDrive download failed for {description}")
                 if attempt < max_retries:
                     logger.info(f"Retrying in {delay}s...")
@@ -133,16 +170,17 @@ def _download_gdrive(file_id: str, dest: Path, description: str, max_retries: in
                     delay *= 2
                     continue
                 return False
-            size = dest.stat().st_size
+            size = part.stat().st_size
             if size == 0:
                 logger.error(f"Downloaded file {dest} is empty!")
-                dest.unlink(missing_ok=True)
+                part.unlink(missing_ok=True)
                 if attempt < max_retries:
                     logger.info(f"Retrying in {delay}s...")
                     time.sleep(delay)
                     delay *= 2
                     continue
                 return False
+            os.replace(part, dest)
             logger.info(f"Downloaded {description} from GDrive: {size:,} bytes  {dest}")
             return True
         except Exception as e:
@@ -175,11 +213,17 @@ def _download_file(file_key: str, dest: Path) -> bool:
     mirrors = config.get("mirrors", [])
     gdrive_fallback = config.get("gdrive_fallback", {})
     
-    # Vor dem Download prüfen wir, ob die Datei bereits existiert und eine vernünftige Größe hat, um unnötige Downloads zu vermeiden (z.B. wenn
+    expected_sha256 = (config.get("sha256") or "").strip().lower() or None
+
+    # Vorhandene Datei nur weiterverwenden, wenn sie vollständig ist. Downloads landen erst
+    # nach Abschluss unter dem endgültigen Namen; mit sha256 in mirrors.json wird zusätzlich geprüft.
     if dest.exists() and dest.stat().st_size > 0:
-        logger.info(f"{description} already exists at {dest} ({dest.stat().st_size:,} bytes), skipping download.")
-        return True
-    
+        if _checksum_ok(dest, expected_sha256, description):
+            logger.info(f"{description} already exists at {dest} ({dest.stat().st_size:,} bytes), skipping download.")
+            return True
+        logger.warning(f"{description} at {dest} failed the checksum – downloading again.")
+        dest.unlink(missing_ok=True)
+
     max_retries = DOWNLOAD_SETTINGS.get("max_retries", 3)
     retry_delay = DOWNLOAD_SETTINGS.get("retry_delay_seconds", 10)
     
@@ -187,7 +231,9 @@ def _download_file(file_key: str, dest: Path) -> bool:
     for mirror_url in mirrors:
         for attempt in range(1, max_retries + 1):
             if _download_http(mirror_url, dest, description):
-                return True
+                if _checksum_ok(dest, expected_sha256, description):
+                    return True
+                dest.unlink(missing_ok=True)
             if attempt < max_retries:
                 logger.info(f"Mirror attempt {attempt}/{max_retries} failed, retrying in {retry_delay}s...")
                 time.sleep(retry_delay)
@@ -197,7 +243,11 @@ def _download_file(file_key: str, dest: Path) -> bool:
     gdrive_id = gdrive_fallback.get("file_id")
     if gdrive_id:
         logger.info(f"All mirrors failed for {description}, falling back to Google Drive...")
-        return _download_gdrive(gdrive_id, dest, description, max_retries=5, retry_delay=60)
+        if _download_gdrive(gdrive_id, dest, description, max_retries=5, retry_delay=60):
+            if _checksum_ok(dest, expected_sha256, description):
+                return True
+            dest.unlink(missing_ok=True)
+        return False
     
     logger.error(f"No mirrors or GDrive fallback available for {description}")
     return False
