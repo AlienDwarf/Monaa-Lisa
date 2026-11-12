@@ -1,7 +1,9 @@
 /**
  * Nico August 2025
  */
+import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import compression from 'compression';
 import { AppModule } from './app.module';
 
 type EnvAccessor = {
@@ -22,6 +24,19 @@ async function bootstrap() {
     .split(',')
     .map((origin) => origin.trim())
     .filter(Boolean);
+
+  // Ohne diese Pipe werden die class-validator-Dekoratoren der DTOs
+  // (z. B. @Max auf `take`) und deren Defaults nie angewendet.
+  app.useGlobalPipes(
+    new ValidationPipe({
+      transform: true,
+      whitelist: true,
+    }),
+  );
+
+  // gzip für JSON-Antworten – die Punktwolke ganzer Kategorien schrumpft
+  // dadurch auf etwa ein Drittel.
+  app.use(compression());
 
   app.enableCors({
     origin(origin, callback) {

@@ -35,11 +35,21 @@ model Paper {
   // wird für die python anwendung benutzt um die koordinaten für umap bereitzustellen
   tsne                      Json?
 
+  // Abgeleitete Spalten (gepflegt von der Python-Pipeline bzw. import_dataset.py):
+  // - category_list: alle Kategorien als Array → exakter Match ("cs.CL" trifft
+  //   nicht mehr "physics.class-ph" wie bei LIKE '%cs.CL%'), GIN-indiziert
+  // - primary_category: erste Kategorie, für Präfix-Filter wie "cs."
+  // - arxiv_citation_count: Anzahl Zeilen in paper_citation für dieses Paper,
+  //   damit Sortieren nach Zitationen nicht jedes Mal zählen muss
+  primary_category          String?
+  category_list             String[]  @default([])
+  arxiv_citation_count      Int       @default(0)
+
   // Optimale Suchindizes
   // Für schnelle Sortierung
   @@index([published(sort: Desc)])
 
-  // Um Kategorien zu durchsuchen
+  // Um Kategorien zu durchsuchen (Freitext; für Filter category_list nutzen)
   @@index([categories(ops: raw("gin_trgm_ops"))], type: Gin)
 
   // schnelle suche einmal nach gezielt titel oder gezielt autoren
@@ -47,8 +57,9 @@ model Paper {
   @@index([authors(ops: raw("gin_trgm_ops"))], type: Gin)
   @@index([abstract(ops: raw("gin_trgm_ops"))], type: Gin)
 
-  // unsere häufigste query: alle paper einer kategorie und sortiert nach zitationen
-  @@index([categories, non_arxiv_citation_count(sort: Desc)])
+  // unsere häufigste query: alle paper einer kategorie, sortiert nach zitationen
+  @@index([category_list], type: Gin)
+  @@index([arxiv_citation_count(sort: Desc)])
 
   @@map("paper")
 }
@@ -128,6 +139,16 @@ model HistoricalCompletion {
   oldest_paper_date      DateTime?
 
   @@map("historical_completion")
+}
+
+// Einfache Schlüssel/Wert-Tabelle für Betriebszustände der Python-Anwendung,
+// z. B. dataset_import = "complete", sobald der Erstimport vollständig durchlief.
+model AppState {
+  key        String   @id
+  value      String
+  updated_at DateTime @default(now())
+
+  @@map("app_state")
 }
 
 model UncaughtPaper {
