@@ -24,6 +24,7 @@
     import Dashboard from "./Dashboard.svelte";
     import type {
         ApiPaper,
+        CategoryPoints,
         Paper,
         PapersResponse,
         ClusterNode,
@@ -161,8 +162,11 @@
     /** View to return to when pressing back from detail */
     let previousView: ViewState = { level: "top" };
 
-    // paper data (only loaded at papers/detail level)
-    let papers: Paper[] = [];
+    // Punktwolke der aktuellen Kategorie (nur auf papers/detail-Ebene).
+    // Spaltenorientiert (Typed Arrays), siehe fetchCategoryPoints.
+    let points: CategoryPoints | null = null;
+    /** Kategorie, zu der `points` gehört bzw. gerade geladen wird. */
+    let pointsCategory: string | null = null;
     // sample papers for sidebar in cluster views (top / sub)
     let sidebarSamplePapers: Paper[] = [];
 
@@ -376,7 +380,7 @@
                 label: "All Categories",
                 action: () => {
                     view = { level: "top" };
-                    papers = [];
+                    clearPoints();
                     error = null;
                 },
             },
@@ -394,7 +398,7 @@
                         "";
                     if (!pid) return; // guard: no matching cluster, don't crash
                     view = { level: "sub", parentName: pName, parentId: pid };
-                    papers = [];
+                    clearPoints();
                     error = null;
                     loadSamplePapers({ parentId: pid });
                 },
@@ -416,7 +420,11 @@
                         categoryName: cName,
                         parentName: pName,
                     };
-                    loadPapers(cId);
+                    authorHighlight = "";
+                    searchHighlightPapers = [];
+                    // Punkte dieser Kategorie sind evtl. schon geladen (Graph
+                    // blieb während der Detailansicht gemountet) → nicht neu laden
+                    if (pointsCategory !== cId) loadPapers(cId);
                 },
             });
         }
@@ -436,6 +444,8 @@
     function handleTopClusterClick(
         e: CustomEvent<{ id: string; name: string; color: string }>,
     ) {
+        // Nur auf der Top-Ebene und nicht doppelt (Klick + Auto-Drill)
+        if (view.level !== "top" || drillTransitioning) return;
         // User clicked a top-level blob - drill into its subcategories with a fade transition
         drillDown(() => {
             currentCategoryColor = e.detail.color;
@@ -445,7 +455,7 @@
                 parentName: e.detail.name,
                 parentId: e.detail.id,
             };
-            papers = [];
+            clearPoints();
             error = null;
             loadSamplePapers({ parentId: e.detail.id });
         });
@@ -454,7 +464,7 @@
     function handleSubClusterClick(
         e: CustomEvent<{ id: string; name: string; color: string }>,
     ) {
-        if (view.level !== "sub") return;
+        if (view.level !== "sub" || drillTransitioning) return;
         // Capture the current parentName before the async transition
         const parentName = view.parentName;
         // User clicked a subcategory blob - load papers and switch to graph view with fade
@@ -596,14 +606,9 @@
 
     async function handleRestoreSession(e: CustomEvent<PaperSession>) {
         const session = e.detail;
-        // Try to find the paper in the currently loaded set first (fast path)
-        // (Punkte aus /papers/points haben noch keine Details → nicht verwenden)
+        // Try to find the paper in the sidebar sample first (fast path)
+        // (Punkte aus /papers/points haben keine Details → nicht verwendbar)
         let paper: Paper | null =
-            papers.find(
-                (p) =>
-                    p.entry_id === session.mainPaper.entry_id &&
-                    p.detailsLoaded !== false,
-            ) ??
             sidebarSamplePapers.find(
                 (p) => p.entry_id === session.mainPaper.entry_id,
             ) ??
@@ -624,8 +629,8 @@
             }
         }
 
-        if (!paper) {
-            // Fall back to title search
+        if (!paper && session.mainPaper.title.trim().length >= 3) {
+            // Fall back to title search (Backend verlangt >= 3 Zeichen)
             try {
                 const res = await fetch(
                     `${API_BASE_URL}/papers?search=${encodeURIComponent(session.mainPaper.title.slice(0, 80))}&take=10`,
@@ -679,14 +684,29 @@
     // Antwort nicht die Daten einer später gewählten Kategorie überschreibt.
     let papersAbort: AbortController | null = null;
 
+    /** Punktwolke verwerfen und laufendes Laden abbrechen (Verlassen der papers-Ebene). */
+    function clearPoints() {
+        papersAbort?.abort();
+        papersAbort = null;
+        points = null;
+        pointsCategory = null;
+        loading = false;
+    }
+
+    // Sicherheitsnetz: papers-Ebene ohne passende Punkte (z. B. Back aus
+    // einer Detailansicht einer anderen Kategorie) → laden.
+    $: if (view.level === "papers" && pointsCategory !== view.categoryId)
+        loadPapers(view.categoryId);
+
     async function loadPapers(categoryId: string) {
         papersAbort?.abort();
         const ctrl = new AbortController();
         papersAbort = ctrl;
 
+        pointsCategory = categoryId;
         loading = true;
         error = null;
-        papers = [];
+        points = null;
         // Clear stale search highlights whenever a new category is loaded.
         searchHighlightPapers = [];
         // Sidebar zeigt die meistzitierten Paper mit vollen Details
@@ -699,13 +719,13 @@
                 ctrl.signal,
             );
             if (ctrl.signal.aborted) return;
-            papers = loaded;
-            if (!papers.length)
+            if (!loaded.count)
                 error = "Keine Papers für diese Kategorie gefunden.";
+            else points = loaded;
         } catch (err) {
             if (ctrl.signal.aborted) return;
             error = err instanceof Error ? err.message : "Fehler beim Laden.";
-            papers = [];
+            points = null;
         } finally {
             if (papersAbort === ctrl) {
                 loading = false;
@@ -845,7 +865,7 @@
     <!-- metric cards row -->
     <MetricCards
         {view}
-        paperCount={papers.length}
+        paperCount={points?.count ?? 0}
         clusterCount={currentClusterCount}
         {arxivCitationCount}
         {arxivReferenceCount}
@@ -974,37 +994,58 @@
                     on:clusterClick={handleSubClusterClick}
                 />
 
-                <!-- ── PAPERS VIEW ── -->
-            {:else if view.level === "papers"}
-                {#if loading}
-                    <div class="status-card">
-                        <LoadingSpinner size={60} />
-                        <p>Fetching Papers for {view.categoryName}…</p>
-                    </div>
-                {:else if error}
-                    <div class="status-card error">
-                        <p>{error}</p>
-                        <button on:click={() => loadPapers(view.categoryId)}
-                            >Erneut versuchen</button
-                        >
-                    </div>
-                {:else}
-                    <Graph
-                        {papers}
-                        {selectedPaperId}
-                        categoryColor={currentCategoryColor}
-                        {authorHighlight}
-                        {searchHighlightPapers}
-                        apiBaseUrl={API_BASE_URL}
-                        categoryId={view.categoryId}
-                        on:paperSelected={handlePaperSelected}
-                        on:nodeDeselected={handleNodeDeselected}
-                    />
-                {/if}
+            {/if}
 
-                <!-- ── PAPER DETAIL VIEW ── -->
-            {:else if view.level === "detail"}
-                {#key `${view.paper.entry_id}_${nodeLimit}`}
+            <!-- ── PAPERS VIEW ──
+                 Bleibt während der Detailansicht gemountet (nur versteckt),
+                 damit Back nicht den ganzen Sigma-Graphen neu aufbaut. -->
+            {#if view.level === "papers" || view.level === "detail"}
+                <div
+                    class="papers-layer"
+                    class:papers-layer-hidden={view.level !== "papers"}
+                >
+                    {#if view.level === "papers" && loading}
+                        <div class="status-card">
+                            <LoadingSpinner size={60} />
+                            <p>Fetching Papers for {view.categoryName}…</p>
+                        </div>
+                    {:else if view.level === "papers" && error}
+                        <div class="status-card error">
+                            <p>{error}</p>
+                            <button
+                                on:click={() =>
+                                    view.level === "papers" &&
+                                    loadPapers(view.categoryId)}
+                                >Erneut versuchen</button
+                            >
+                        </div>
+                    {/if}
+                    {#if points && !loading}
+                        {#key points}
+                            <Graph
+                                {points}
+                                {selectedPaperId}
+                                categoryColor={currentCategoryColor}
+                                authorHighlight={view.level === "papers"
+                                    ? authorHighlight
+                                    : ""}
+                                searchHighlightPapers={view.level === "papers"
+                                    ? searchHighlightPapers
+                                    : []}
+                                apiBaseUrl={API_BASE_URL}
+                                categoryId={points.category}
+                                on:paperSelected={handlePaperSelected}
+                                on:nodeDeselected={handleNodeDeselected}
+                            />
+                        {/key}
+                    {/if}
+                </div>
+            {/if}
+
+            <!-- ── PAPER DETAIL VIEW ── -->
+            {#if view.level === "detail"}
+                <!-- nur auf entry_id keyen: nodeLimit-Wechsel baut lokal neu -->
+                {#key view.paper.entry_id}
                     <PaperDetailGraph
                         paper={view.paper}
                         apiBaseUrl={API_BASE_URL}
@@ -1048,8 +1089,7 @@
                 isOpen={sidebarOpen}
                 {dashboardOpen}
                 {selectedPaperId}
-                categoryFilter={view.level === "papers" ||
-                view.level === "detail"
+                categoryFilter={view.level === "papers"
                     ? view.categoryId
                     : view.level === "sub"
                       ? (CLUSTER_CAT_PREFIX[(view as any).parentId] ?? "")
@@ -1378,6 +1418,19 @@
         margin: 0 4px 4px 4px;
         border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.08));
         background: var(--bg-primary, #0f1020);
+    }
+
+    /* Papers-Ansicht: füllt das Panel; während der Detailansicht nur
+       versteckt (bleibt gemountet, behält Sigma-Zustand + Kamera). */
+    .papers-layer {
+        position: absolute;
+        inset: 0;
+        display: flex;
+    }
+    .papers-layer-hidden {
+        visibility: hidden;
+        pointer-events: none;
+        z-index: -1;
     }
 
     :global(.graph-wrapper),

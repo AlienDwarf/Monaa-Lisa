@@ -92,6 +92,14 @@
     let particles: Particle[] = [];
     let edgeAnimator: EdgeAnimator | null = null;
     let animFrameId = 0;
+    /** wird bei jedem rebuild erhöht → statische Ebene neu zeichnen */
+    let layoutVersion = 0;
+    // Statische Ebene (Glows, Ringe, Partikel, Labels) in einem Offscreen-
+    // Canvas. Nur bei Änderung von Ansicht/Hover/Layout neu zeichnen; pro
+    // Frame werden nur noch die animierten Kanten + ein drawImage gerendert
+    // statt ~300 Gradients und shadowBlur-Text.
+    let staticCanvas: HTMLCanvasElement | null = null;
+    let staticKey = "";
 
     // ─── colour helpers ───────────────────────────────────────────────
     function assignColor(c: ClusterNode, idx: number): string {
@@ -347,6 +355,7 @@
     function rebuild(W: number, H: number) {
         laid = computeLayout();
         particles = generateParticles(laid);
+        layoutVersion++;
         initialView = computeInitialView(laid, W, H);
         view = { ...initialView };
         if (edgeAnimator) {
@@ -400,6 +409,31 @@
         edgeAnimator?.update(Date.now());
         edgeAnimator?.draw(ctx, view);
 
+        // statische Ebene nur bei Änderungen neu zeichnen, sonst nur blitten
+        const key = `${view.scale}|${view.offsetX}|${view.offsetY}|${hoveredCluster}|${canvasEl.width}|${canvasEl.height}|${dpr}|${layoutVersion}`;
+        if (!staticCanvas) staticCanvas = document.createElement("canvas");
+        if (key !== staticKey) {
+            if (
+                staticCanvas.width !== canvasEl.width ||
+                staticCanvas.height !== canvasEl.height
+            ) {
+                staticCanvas.width = canvasEl.width;
+                staticCanvas.height = canvasEl.height;
+            }
+            const sctx = staticCanvas.getContext("2d");
+            if (!sctx) return;
+            sctx.setTransform(1, 0, 0, 1, 0, 0);
+            sctx.clearRect(0, 0, staticCanvas.width, staticCanvas.height);
+            sctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            drawStatic(sctx);
+            staticKey = key;
+        }
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        if (staticCanvas.width > 0 && staticCanvas.height > 0)
+            ctx.drawImage(staticCanvas, 0, 0);
+    }
+
+    function drawStatic(ctx: CanvasRenderingContext2D) {
         // ── territory glows (smooth radial gradients) ──
         laid.forEach((c) => {
             const s = w2s(c.x, c.y);
@@ -791,6 +825,12 @@
         return () => {
             ro.disconnect();
             cancelAnimationFrame(animFrameId);
+            if (autoDrillTimeout) {
+                clearTimeout(autoDrillTimeout);
+                autoDrillTimeout = null;
+            }
+            autoDrillPending = false;
+            staticCanvas = null;
             window.removeEventListener("mousemove", handleDragMove);
             window.removeEventListener("mouseup", handleDragEnd);
         };

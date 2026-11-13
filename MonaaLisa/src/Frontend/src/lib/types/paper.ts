@@ -69,6 +69,21 @@ export interface CategoryPointsResponse {
 }
 
 /**
+ * Spaltenorientierte Punktwolke im Frontend (aus CategoryPointsResponse).
+ * Index i beschreibt einen Punkt: ids[i], x[i], y[i], cc[i] (arXiv-
+ * Zitationen), nc[i] (Nicht-arXiv-Zitationen).
+ */
+export interface CategoryPoints {
+    category: string;
+    count: number;
+    ids: string[];
+    x: Float32Array;
+    y: Float32Array;
+    cc: Uint32Array;
+    nc: Uint32Array;
+}
+
+/**
  * A fetched paper from the neighbourhood API (used in PaperSidebar).
  */
 export interface NeighbourPaper {

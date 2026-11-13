@@ -1,7 +1,12 @@
 /**
  * Gemeinsame Helfer zum Laden und Normalisieren von Papern aus dem Backend.
  */
-import type { ApiPaper, CategoryPointsResponse, Paper } from "$lib/types/paper";
+import type {
+    ApiPaper,
+    CategoryPoints,
+    CategoryPointsResponse,
+    Paper,
+} from "$lib/types/paper";
 
 /** Liest `tsne` als Objekt oder (doppelt kodierten) JSON-String. */
 export function parseTsne(tsne: unknown): [number, number] {
@@ -78,15 +83,16 @@ export function normalizePaper(raw: ApiPaper, index: number): Paper | null {
 /**
  * Lädt die Punktwolke einer Kategorie (GET /papers/points).
  * `limit` <= 0 bzw. undefined = alle Paper der Kategorie.
- * Die gelieferten Paper haben nur ID, Koordinaten und Zitationszahlen
- * (`detailsLoaded: false`); Details über `fetchPaperDetails` nachladen.
+ * Die Antwort bleibt spaltenorientiert (Typed Arrays statt ein Objekt pro
+ * Punkt), damit auch Millionen Punkte wenig Speicher brauchen. Details
+ * (Titel, Autoren, …) über `fetchPaperDetails` nachladen.
  */
 export async function fetchCategoryPoints(
     apiBaseUrl: string,
     category: string,
     limit: number | undefined,
     signal?: AbortSignal,
-): Promise<Paper[]> {
+): Promise<CategoryPoints> {
     const params = new URLSearchParams({ category });
     if (limit && limit > 0) params.set("limit", String(limit));
     const res = await fetch(
@@ -96,30 +102,45 @@ export async function fetchCategoryPoints(
     if (!res.ok) throw new Error(`Backend ${res.status}`);
     const data = (await res.json()) as CategoryPointsResponse;
 
-    const n = data.ids?.length ?? 0;
-    const papers: Paper[] = new Array(n);
+    const ids = Array.isArray(data.ids) ? data.ids : [];
+    const n = ids.length;
+    const x = new Float32Array(n);
+    const y = new Float32Array(n);
+    const cc = new Uint32Array(n);
+    const nc = new Uint32Array(n);
     for (let i = 0; i < n; i++) {
-        papers[i] = {
-            id: i,
-            entry_id: data.ids[i],
-            title: "",
-            authors: "",
-            abstract: "",
-            published: null,
-            categories: category,
-            url: null,
-            citations: [],
-            references: [],
-            non_arxiv_citation_count: data.nc[i] ?? 0,
-            non_arxiv_reference_count: 0,
-            tsne1: data.x[i],
-            tsne2: data.y[i],
-            cluster: category,
-            arxiv_citation_count: data.cc[i] ?? 0,
-            detailsLoaded: false,
-        };
+        x[i] = data.x?.[i] ?? 0;
+        y[i] = data.y?.[i] ?? 0;
+        cc[i] = data.cc?.[i] ?? 0;
+        nc[i] = data.nc?.[i] ?? 0;
     }
-    return papers;
+    return { category, count: n, ids, x, y, cc, nc };
+}
+
+/**
+ * Baut ein (Detail-loses) Paper-Objekt für Punkt `i` – nur bei Bedarf
+ * (Hover/Klick), nicht für alle Punkte.
+ */
+export function pointToPaper(points: CategoryPoints, i: number): Paper {
+    return {
+        id: i,
+        entry_id: points.ids[i],
+        title: "",
+        authors: "",
+        abstract: "",
+        published: null,
+        categories: points.category,
+        url: null,
+        citations: [],
+        references: [],
+        non_arxiv_citation_count: points.nc[i],
+        non_arxiv_reference_count: 0,
+        tsne1: points.x[i],
+        tsne2: points.y[i],
+        cluster: points.category,
+        arxiv_citation_count: points.cc[i],
+        detailsLoaded: false,
+    };
 }
 
 /**
@@ -132,6 +153,8 @@ export async function fetchAuthorPaperIds(
     author: string,
     signal?: AbortSignal,
 ): Promise<string[]> {
+    // Backend verlangt >= 3 Zeichen für `author`
+    if (author.trim().length < 3) return [];
     try {
         const params = new URLSearchParams({ category, author });
         const res = await fetch(

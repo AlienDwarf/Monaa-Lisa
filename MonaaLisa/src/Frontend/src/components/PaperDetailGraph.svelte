@@ -22,6 +22,11 @@
     import type { Paper } from "$lib/types/paper";
     import { getSubcategoryName } from "../utils/arxivTaxonomy";
     import LoadingSpinner from "./LoadingSpinner.svelte";
+    import {
+        fetchNeighbourIds,
+        fetchNeighbourPapers,
+        type RawNeighbourPaper,
+    } from "../utils/neighbourhood";
 
     /** The paper whose neighbourhood we are visualising. */
     export let paper: Paper;
@@ -92,23 +97,23 @@
     const COLOR_DUMMY = "#555555";
 
     // ─── raw fetched data (cached for filter rebuilds) ────────────────
-    interface CitationRow {
-        belonging_paper_entry_id: string;
-        cited_paper_entry_id: string;
-    }
-    interface ReferenceRow {
-        belonging_paper_entry_id: string;
-        referenced_paper_entry_id: string;
-    }
     interface FetchedData {
-        citations: CitationRow[];
-        references: ReferenceRow[];
+        /** deduplizierte IDs der zitierten Paper */
         citedIds: string[];
+        /** deduplizierte IDs der zitierenden Paper */
         referencedIds: string[];
-        realPapers: Record<string, any>;
+        citedSet: Set<string>;
+        /** referencedIds ohne IDs, die bereits als Zitation vorkommen */
+        refOnlyIds: string[];
+        /** geladene Paper (nur für die angezeigten IDs) */
+        realPapers: Map<string, RawNeighbourPaper>;
     }
 
     let fetchedData: FetchedData | null = null;
+    /** nodeLimit, für das realPapers vollständig geladen ist */
+    let loadedLimit: number | null = null;
+    const lifecycleAbort = new AbortController();
+    let limitAbort: AbortController | null = null;
 
     // ─── tooltip state for non-arXiv aggregate node ───────────────────
     let hoveredPaper: any | null = null;
@@ -138,47 +143,80 @@
     }
 
     // ─── data fetching ────────────────────────────────────────────────
-    async function fetchNeighbourhood() {
-        const [citRes, refRes] = await Promise.all([
-            fetch(
-                `${apiBaseUrl}/paper-citations/paper/${encodeURIComponent(paper.entry_id)}`,
-            ),
-            fetch(
-                `${apiBaseUrl}/paper-references/paper/${encodeURIComponent(paper.entry_id)}`,
-            ),
-        ]);
+    // IDs + Paper kommen aus dem gemeinsamen Cache (utils/neighbourhood),
+    // den auch PaperSidebar nutzt. Details werden nur für die IDs geladen,
+    // die beim aktuellen nodeLimit tatsächlich als Knoten erscheinen.
+    function visibleIds(data: FetchedData, limit: number): string[] {
+        const half = limit > 0 ? Math.floor(limit / 2) : Infinity;
+        return [
+            ...data.citedIds.slice(0, half),
+            ...data.refOnlyIds.slice(0, half),
+        ];
+    }
 
-        const citations: CitationRow[] = citRes.ok ? await citRes.json() : [];
-        const references: ReferenceRow[] = refRes.ok ? await refRes.json() : [];
-
-        const citedIds = citations.map((c) => c.cited_paper_entry_id);
-        const referencedIds = references.map(
-            (r) => r.referenced_paper_entry_id,
+    async function fetchNeighbourhood(signal: AbortSignal): Promise<FetchedData> {
+        const ids = await fetchNeighbourIds(apiBaseUrl, paper.entry_id, signal);
+        const citedSet = new Set(ids.citedIds);
+        const data: FetchedData = {
+            citedIds: ids.citedIds,
+            referencedIds: ids.referencedIds,
+            citedSet,
+            refOnlyIds: ids.referencedIds.filter((id) => !citedSet.has(id)),
+            realPapers: new Map(),
+        };
+        const limit = nodeLimit;
+        data.realPapers = await fetchNeighbourPapers(
+            apiBaseUrl,
+            visibleIds(data, limit),
+            signal,
         );
-        const allIds = [...new Set([...citedIds, ...referencedIds])];
+        loadedLimit = limit;
+        return data;
+    }
 
-        let realPapers: Record<string, any> = {};
-        if (allIds.length > 0) {
-            const batchSize = 500;
-            const batches: string[][] = [];
-            for (let i = 0; i < allIds.length; i += batchSize) {
-                batches.push(allIds.slice(i, i + batchSize));
-            }
-            const results = await Promise.all(
-                batches.map((ids) =>
-                    fetch(`${apiBaseUrl}/papers/batch`, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ entryIds: ids }),
-                    }).then((r) => (r.ok ? r.json() : [])),
-                ),
+    // nodeLimit-Wechsel: nur fehlende Paper nachladen und lokal neu bauen
+    // (statt die ganze Komponente neu zu mounten und alles neu zu laden).
+    $: onNodeLimitChange(nodeLimit);
+
+    async function onNodeLimitChange(limit: number) {
+        if (!fetchedData || loadedLimit === null || limit === loadedLimit)
+            return;
+        limitAbort?.abort();
+        const ctrl = new AbortController();
+        limitAbort = ctrl;
+        const onLifecycleAbort = () => ctrl.abort();
+        lifecycleAbort.signal.addEventListener("abort", onLifecycleAbort, {
+            once: true,
+        });
+        const data = fetchedData;
+        try {
+            const missing = visibleIds(data, limit).filter(
+                (id) => !data.realPapers.has(id),
             );
-            results.flat().forEach((p: any) => {
-                realPapers[p.entry_id] = p;
-            });
+            if (missing.length) {
+                loading = true;
+                const more = await fetchNeighbourPapers(
+                    apiBaseUrl,
+                    missing,
+                    ctrl.signal,
+                );
+                if (ctrl.signal.aborted || fetchedData !== data) return;
+                for (const [id, p] of more) data.realPapers.set(id, p);
+            }
+            loadedLimit = limit;
+            loading = false;
+            if (viewMode === "graph") {
+                await tick();
+                rebuildRenderer();
+            }
+        } catch (err) {
+            if (ctrl.signal.aborted) return;
+            errorMsg = err instanceof Error ? err.message : String(err);
+            loading = false;
+        } finally {
+            lifecycleAbort.signal.removeEventListener("abort", onLifecycleAbort);
+            if (limitAbort === ctrl) limitAbort = null;
         }
-
-        return { citations, references, citedIds, referencedIds, realPapers };
     }
 
     // ─── spread algorithm: push apart overlapping nodes ───────────────
@@ -314,21 +352,21 @@
     // ─── edge colour helper: fade opacity near the selected (center) node ────
     // Edges whose far endpoint lies close to the origin get reduced opacity so
     // the dense cluster right around the selected paper stays readable.
-    function edgeColor(
-        r: number,
-        g: number,
-        b: number,
+    // Liefert vorgeparste Attribute (rgb + baseAlpha), damit der edgeReducer
+    // beim Zoomen nur noch den Faktor anwenden muss (kein Regex pro Frame).
+    function edgeAttrs(
+        rgb: string,
         baseAlpha: number,
         nodeX: number,
         nodeY: number,
-    ): string {
+    ): { color: string; rgb: string; baseAlpha: number } {
         const dist = Math.sqrt(nodeX * nodeX + nodeY * nodeY);
         // Full opacity is reached at FADE_DIST units away from center
         const FADE_DIST = 20;
         const t = Math.min(dist / FADE_DIST, 1);
         // Minimum alpha is 35% of base so edges never fully disappear
         const alpha = baseAlpha * 0.35 + baseAlpha * 0.65 * t;
-        return `rgba(${r},${g},${b},${alpha.toFixed(3)})`;
+        return { color: `rgba(${rgb},${alpha.toFixed(3)})`, rgb, baseAlpha: alpha };
     }
 
     function buildGraph(data: FetchedData) {
@@ -349,9 +387,9 @@
         const REFERENCE_LIMIT = halfLimit;
 
         if (showCitations) {
-            const citIds = [...new Set(data.citedIds)].slice(0, CITATION_LIMIT);
+            const citIds = data.citedIds.slice(0, CITATION_LIMIT);
             citIds.forEach((id, i) => {
-                const real = data.realPapers[id];
+                const real = data.realPapers.get(id);
                 const label = real ? truncate(real.title, 50) : id.slice(0, 20);
                 const color = real ? COLOR_CITATION : COLOR_DUMMY;
                 const size = real ? 5 : 3;
@@ -385,7 +423,7 @@
                 }
                 // Edge colour fades near the center so clustered edges stay readable
                 g.addEdge(paper.entry_id, id, {
-                    color: edgeColor(255, 107, 107, 0.35, x, y),
+                    ...edgeAttrs("255,107,107", 0.35, x, y),
                     size: 0.6,
                     type: "arrow",
                 });
@@ -393,11 +431,9 @@
         }
 
         if (showReferences) {
-            const refIds = [...new Set(data.referencedIds)]
-                .filter((id) => !data.citedIds.includes(id))
-                .slice(0, REFERENCE_LIMIT);
+            const refIds = data.refOnlyIds.slice(0, REFERENCE_LIMIT);
             refIds.forEach((id, i) => {
-                const real = data.realPapers[id];
+                const real = data.realPapers.get(id);
                 const label = real ? truncate(real.title, 50) : id.slice(0, 20);
                 const color = real ? COLOR_REFERENCE : COLOR_DUMMY;
                 const size = real ? 4.5 : 2.5;
@@ -430,7 +466,7 @@
                 }
                 // Edge colour fades near the center so clustered edges stay readable
                 g.addEdge(id, paper.entry_id, {
-                    color: edgeColor(78, 205, 196, 0.3, x, y),
+                    ...edgeAttrs("78,205,196", 0.3, x, y),
                     size: 0.5,
                     type: "arrow",
                 });
@@ -460,12 +496,16 @@
                 if (nonArxivCit > 0) {
                     g.addEdge(paper.entry_id, dummyId, {
                         color: "rgba(85,85,85,0.25)",
+                        rgb: "85,85,85",
+                        baseAlpha: 0.25,
                         size: 0.6,
                     });
                 }
                 if (nonArxivRef > 0 && nonArxivCit === 0) {
                     g.addEdge(dummyId, paper.entry_id, {
                         color: "rgba(85,85,85,0.25)",
+                        rgb: "85,85,85",
+                        baseAlpha: 0.25,
                         size: 0.6,
                     });
                 }
@@ -487,20 +527,59 @@
         if (!fetchedData || !container) return;
         destroySigma();
         graph = buildGraph(fetchedData);
-        // Snapshot edge colours so the zoom-opacity reducer has a baseline after rebuild.
-        storeBaseEdgeColors();
+        createRenderer();
+    }
+
+    // ─── reducer state ───────────────────────────────────────────────
+    // Zoom-Fade der Kanten und Autor-Highlight laufen über Sigma-Reducer
+    // statt über setNodeAttribute/setEdgeAttribute (keine Graph-Events,
+    // keine Regex pro Kante und Frame).
+    const MIN_RATIO = 0.08; // matches minCameraRatio passed to Sigma
+    let edgeFactor = 1;
+    /** lowercase author query, "" = kein Highlight */
+    let authorQ = "";
+    /** Knoten, deren Autoren authorQ enthalten (nur echte Paper) */
+    let authorMatches: Set<string> = new Set();
+    let centerAuthorMatch = false;
+
+    function createRenderer() {
+        if (!graph || !container) return;
         renderer = new Sigma(graph, container, {
             renderEdgeLabels: false,
             defaultNodeType: "circle",
             defaultEdgeType: "line",
-            minCameraRatio: 0.08,
+            minCameraRatio: MIN_RATIO,
             maxCameraRatio: 5,
             labelRenderedSizeThreshold: 18,
             labelColor: { color: "#ccc" },
+            nodeReducer: (node, data) => {
+                if (!authorQ) return data;
+                if (node === paper.entry_id) {
+                    return centerAuthorMatch
+                        ? { ...data, color: "#ffd166", size: 16 }
+                        : data;
+                }
+                if (node === "__non_arxiv_aggregate") return data;
+                if (authorMatches.has(node))
+                    return { ...data, color: "#ffd166", size: 8 };
+                if (fetchedData?.realPapers.has(node))
+                    return { ...data, color: "rgba(255,255,255,0.08)" };
+                return data;
+            },
+            edgeReducer: (_edge, data) => {
+                if (edgeFactor === 1 || !data.rgb) return data;
+                return {
+                    ...data,
+                    color: `rgba(${data.rgb},${(data.baseAlpha * edgeFactor).toFixed(3)})`,
+                };
+            },
         });
         attachSigmaEvents();
-        // Re-attach camera listener so max-zoom label reveal works after filter rebuilds
+        // Re-attach camera listener so max-zoom label reveal works after rebuilds
         attachCameraListener();
+        // Highlight-Zustand für den neuen Graphen neu berechnen
+        computeAuthorMatches(authorHighlight);
+        renderer.refresh();
     }
 
     // ─── camera zoom listener: reveal all labels at max zoom ─────────────
@@ -508,19 +587,21 @@
     // lower the label threshold to 0 so every node’s title becomes visible.
     function attachCameraListener() {
         if (!renderer) return;
-        const MIN_RATIO = 0.08; // matches minCameraRatio passed to Sigma
         const NEAR_MAX_FACTOR = 1.4; // trigger when within 40% of min ratio
-        // Track the last applied edge-opacity factor to avoid redundant graph writes.
-        let lastEdgeFactor = -1;
+        let lastAtMaxZoom = false;
         renderer.getCamera().on("updated", (state: any) => {
             if (!renderer) return;
 
-            // ─ label reveal at max zoom ─
+            // ─ label reveal at max zoom ─ (setSetting löst einen vollen
+            // Refresh aus → nur bei Zustandswechsel setzen)
             const atMaxZoom = state.ratio <= MIN_RATIO * NEAR_MAX_FACTOR;
-            renderer.setSetting(
-                "labelRenderedSizeThreshold",
-                atMaxZoom ? 0 : 18,
-            );
+            if (atMaxZoom !== lastAtMaxZoom) {
+                lastAtMaxZoom = atMaxZoom;
+                renderer.setSetting(
+                    "labelRenderedSizeThreshold",
+                    atMaxZoom ? 0 : 18,
+                );
+            }
 
             // ─ edge opacity fade as user zooms in ──────────────────────────
             // Normalise: t=0 when fully zoomed in, t=1 at normal view distance.
@@ -530,58 +611,19 @@
             );
             // Minimum opacity is 30% so edges never become completely invisible.
             const factor = 0.3 + 0.7 * t;
-            // Only rewrite edge attributes when the shift is visually noticeable
-            // (> 2%) to avoid unnecessary per-frame graph writes.
-            if (Math.abs(factor - lastEdgeFactor) > 0.02) {
-                lastEdgeFactor = factor;
-                if (!graph) return;
-                graph.forEachEdge((edge) => {
-                    const base = graph!.getEdgeAttribute(
-                        edge,
-                        "baseColor",
-                    ) as string;
-                    if (base) {
-                        graph!.setEdgeAttribute(
-                            edge,
-                            "color",
-                            applyAlphaFactor(base, factor),
-                        );
-                    }
-                });
-                renderer.refresh();
+            // Only refresh when the shift is visually noticeable (> 2%).
+            if (Math.abs(factor - edgeFactor) > 0.02 || (factor === 1 && edgeFactor !== 1)) {
+                edgeFactor = factor;
+                // Nur Kanten neu durch den edgeReducer schicken, Knoten
+                // und Indizes bleiben unverändert.
+                if (graph)
+                    renderer.refresh({
+                        partialGraph: { edges: graph.edges() },
+                        skipIndexation: true,
+                        schedule: true,
+                    });
             }
         });
-    }
-
-    /**
-     * Copy each edge's current `color` into a `baseColor` attribute so the
-     * zoom-opacity reducer always has the original colour to scale from.
-     * Must be called immediately after buildGraph / rebuildRenderer.
-     */
-    function storeBaseEdgeColors() {
-        if (!graph) return;
-        graph.forEachEdge((e) => {
-            graph!.setEdgeAttribute(
-                e,
-                "baseColor",
-                graph!.getEdgeAttribute(e, "color"),
-            );
-        });
-    }
-
-    /**
-     * Parse an `rgba(r,g,b,a)` or `rgb(r,g,b)` colour string and return a new
-     * one with its alpha channel multiplied by `factor`.  If parsing fails the
-     * original string is returned unchanged.
-     */
-    function applyAlphaFactor(rgba: string, factor: number): string {
-        const m = rgba.match(
-            /rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/,
-        );
-        if (!m) return rgba;
-        const [, r, g, b] = m;
-        const a = parseFloat(m[4] ?? "1");
-        return `rgba(${r},${g},${b},${(a * factor).toFixed(3)})`;
     }
 
     function destroySigma() {
@@ -614,8 +656,8 @@
                     non_arxiv_reference_count: paper.non_arxiv_reference_count,
                 };
                 tooltipText = null;
-            } else if (fetchedData?.realPapers[node]) {
-                const rp = fetchedData.realPapers[node];
+            } else if (fetchedData?.realPapers.has(node)) {
+                const rp = fetchedData.realPapers.get(node)!;
                 hoveredPaper = {
                     title: rp.title ?? node,
                     authors: Array.isArray(rp.authors)
@@ -653,7 +695,7 @@
             if (node === paper.entry_id || node === "__non_arxiv_aggregate")
                 return;
             if (!fetchedData) return;
-            const raw = fetchedData.realPapers[node];
+            const raw: any = fetchedData.realPapers.get(node);
             if (!raw) return;
             // Build a Paper-like object from the raw API data
             const [tx, ty] = parseTsne(raw.tsne);
@@ -700,59 +742,22 @@
     // ─── reactive author highlight for citation graph ───────────────
     $: handleDetailAuthorHighlight(authorHighlight);
 
-    function handleDetailAuthorHighlight(author: string) {
-        if (!graph || !renderer || !fetchedData || viewMode !== "graph") return;
-        if (!author) {
-            // Reset colors
-            graph.forEachNode((n) => {
-                if (n === paper.entry_id) {
-                    graph!.setNodeAttribute(n, "color", COLOR_CENTER);
-                } else if (n === "__non_arxiv_aggregate") {
-                    graph!.setNodeAttribute(n, "color", COLOR_DUMMY);
-                } else {
-                    const real = fetchedData!.realPapers[n];
-                    const isCitation = fetchedData!.citedIds.includes(n);
-                    graph!.setNodeAttribute(
-                        n,
-                        "color",
-                        real
-                            ? isCitation
-                                ? COLOR_CITATION
-                                : COLOR_REFERENCE
-                            : COLOR_DUMMY,
-                    );
-                }
-            });
-            renderer.refresh();
-            return;
+    function computeAuthorMatches(author: string) {
+        authorQ = (author ?? "").toLowerCase();
+        authorMatches = new Set();
+        centerAuthorMatch = false;
+        if (!authorQ || !fetchedData) return;
+        centerAuthorMatch = (paper.authors ?? "").toLowerCase().includes(authorQ);
+        // Nur die geladenen Nachbar-Paper prüfen (≤ nodeLimit), nicht den Graph
+        for (const [id, real] of fetchedData.realPapers) {
+            if (real.authors.toLowerCase().includes(authorQ))
+                authorMatches.add(id);
         }
-        const q = author.toLowerCase();
-        graph.forEachNode((n) => {
-            if (n === paper.entry_id) {
-                if (paper.authors.toLowerCase().includes(q)) {
-                    graph!.setNodeAttribute(n, "color", "#ffd166");
-                    graph!.setNodeAttribute(n, "size", 16);
-                }
-                return;
-            }
-            if (n === "__non_arxiv_aggregate") return;
-            const real = fetchedData!.realPapers[n];
-            if (real) {
-                const authors = Array.isArray(real.authors)
-                    ? real.authors.join(", ")
-                    : (real.authors ?? "");
-                if (authors.toLowerCase().includes(q)) {
-                    graph!.setNodeAttribute(n, "color", "#ffd166");
-                    graph!.setNodeAttribute(n, "size", 8);
-                } else {
-                    graph!.setNodeAttribute(
-                        n,
-                        "color",
-                        "rgba(255,255,255,0.08)",
-                    );
-                }
-            }
-        });
+    }
+
+    function handleDetailAuthorHighlight(author: string) {
+        computeAuthorMatches(author);
+        if (!graph || !renderer || viewMode !== "graph") return;
         renderer.refresh();
     }
 
@@ -857,6 +862,7 @@
             // Fetch the main paper to get related_arxiv_ids
             const res = await fetch(
                 `${apiBaseUrl}/papers/${encodeURIComponent(paper.entry_id)}`,
+                { signal: lifecycleAbort.signal },
             );
             if (!res.ok)
                 throw new Error(`Failed to fetch paper: ${res.status}`);
@@ -886,6 +892,7 @@
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ entryIds: relatedIds }),
+                signal: lifecycleAbort.signal,
             });
             if (!batchRes.ok)
                 throw new Error(
@@ -924,6 +931,7 @@
                 cardScales = {};
             }
         } catch (e) {
+            if (lifecycleAbort.signal.aborted) return;
             relatedError = e instanceof Error ? e.message : String(e);
         } finally {
             relatedLoading = false;
@@ -1131,12 +1139,14 @@
 
     // ─── lifecycle ────────────────────────────────────────────────────
     onMount(() => {
-        fetchNeighbourhood()
+        const signal = lifecycleAbort.signal;
+        fetchNeighbourhood(signal)
             .then(async (data) => {
+                if (signal.aborted) return;
                 fetchedData = data;
                 dispatch("neighbourhoodLoaded", {
-                    citationCount: [...new Set(data.citedIds)].length,
-                    referenceCount: [...new Set(data.referencedIds)].length,
+                    citationCount: data.citedIds.length,
+                    referenceCount: data.referencedIds.length,
                 });
                 // Yield two animation frames so the browser can paint and
                 // composite the loading spinner before we block the main
@@ -1147,25 +1157,20 @@
                         requestAnimationFrame(() => resolve()),
                     ),
                 );
-                if (!container) return;
-                graph = buildGraph(data);
-                // Snapshot base edge colours for the zoom-opacity reducer.
-                storeBaseEdgeColors();
-                renderer = new Sigma(graph, container, {
-                    renderEdgeLabels: false,
-                    defaultNodeType: "circle",
-                    defaultEdgeType: "line",
-                    minCameraRatio: 0.08,
-                    maxCameraRatio: 5,
-                    labelRenderedSizeThreshold: 18,
-                    labelColor: { color: "#ccc" },
-                });
-                attachSigmaEvents();
-                attachCameraListener();
+                if (signal.aborted) return;
                 loading = false;
                 filtersInitialized = true;
+                // nodeLimit hat sich während des Ladens geändert → nachladen
+                if (loadedLimit !== nodeLimit) {
+                    onNodeLimitChange(nodeLimit);
+                    return;
+                }
+                if (!container || viewMode !== "graph") return;
+                graph = buildGraph(data);
+                createRenderer();
             })
             .catch((err) => {
+                if (signal.aborted) return;
                 errorMsg = err instanceof Error ? err.message : String(err);
                 loading = false;
                 filtersInitialized = true;
@@ -1173,6 +1178,8 @@
     });
 
     onDestroy(() => {
+        lifecycleAbort.abort();
+        limitAbort?.abort();
         destroySigma();
         window.removeEventListener("mousemove", onDragMove);
         window.removeEventListener("mouseup", onDragEnd);
@@ -1192,10 +1199,10 @@
     // fetchedData is more accurate (actual DB relations) vs paper.citations array
     // which may be empty when navigating from a citation link in the sidebar.
     $: relViewCitCount = fetchedData
-        ? [...new Set(fetchedData.citedIds)].length
+        ? fetchedData.citedIds.length
         : (paper.citations?.length ?? 0);
     $: relViewRefCount = fetchedData
-        ? [...new Set(fetchedData.referencedIds)].length
+        ? fetchedData.referencedIds.length
         : (paper.references?.length ?? 0);
 </script>
 

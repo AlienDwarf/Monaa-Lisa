@@ -4,11 +4,16 @@
   Shows the selected paper info, history, citations, references with advanced filter.
 -->
 <script lang="ts">
-    import { createEventDispatcher, onMount } from "svelte";
+    import { createEventDispatcher, onDestroy, onMount } from "svelte";
     import { env as publicEnv } from "$env/dynamic/public";
     import type { Paper } from "$lib/types/paper";
     import { getSubcategoryName } from "../utils/arxivTaxonomy";
     import LoadingSpinner from "./LoadingSpinner.svelte";
+    import {
+        fetchNeighbourIds,
+        fetchNeighbourPapers,
+        type RawNeighbourPaper,
+    } from "../utils/neighbourhood";
 
     export let paper: Paper;
     export let apiBaseUrl: string = publicEnv.PUBLIC_API_BASE_URL || "http://localhost:3000/";
@@ -146,7 +151,10 @@
         dispatch("authorHighlight", nFilter.authorQuery.trim());
     }
 
-    function applyFilter(items: NeighbourPaperItem[]): NeighbourPaperItem[] {
+    function applyFilter(
+        items: NeighbourPaperItem[],
+        nFilter: NeighbourFilter,
+    ): NeighbourPaperItem[] {
         return items.filter((item) => {
             if (nFilter.onlyArxiv && !item.entry_id.startsWith("http")) {
                 // non-arXiv items typically have non-standard ids – but we filter by whether we have real data
@@ -184,10 +192,21 @@
     );
 
     // ─── neighbour data ───────────────────────────────────────────────
+    // IDs und Paper kommen aus dem gemeinsamen Cache (utils/neighbourhood),
+    // den auch PaperDetailGraph nutzt. Details werden seitenweise geladen
+    // (erst PAGE_SIZE pro Liste, weitere über "Load more").
+    const PAGE_SIZE = 50;
     let loading = true;
     let errorMsg: string | null = null;
+    let citedIds: string[] = [];
+    let citedByIds: string[] = [];
+    /** Anzahl IDs pro Liste, für die Details angefordert wurden */
+    let citedRequested = 0;
+    let citedByRequested = 0;
     let citedPapers: NeighbourPaperItem[] = [];
     let citedByPapers: NeighbourPaperItem[] = [];
+    let loadingMoreCited = false;
+    let loadingMoreCitedBy = false;
     let nonArxivCitations = 0;
     let nonArxivReferences = 0;
 
@@ -203,12 +222,49 @@
     > = {};
     let focusedId: string | null = null;
 
+    /** Wird bei jedem Paper-Wechsel und beim Zerstören abgebrochen. */
+    let loadAbort = new AbortController();
+
+    function toItem(p: RawNeighbourPaper): NeighbourPaperItem {
+        return {
+            entry_id: p.entry_id,
+            title: p.title,
+            authors: p.authors,
+            abstract: p.abstract,
+            published: p.published,
+            categories: p.categories,
+            non_arxiv_citation_count: p.non_arxiv_citation_count,
+            non_arxiv_reference_count: p.non_arxiv_reference_count,
+        };
+    }
+
+    function pick(
+        ids: string[],
+        papers: Map<string, RawNeighbourPaper>,
+    ): NeighbourPaperItem[] {
+        const out: NeighbourPaperItem[] = [];
+        for (const id of ids) {
+            const p = papers.get(id);
+            if (p) out.push(toItem(p));
+        }
+        return out;
+    }
+
     // ─── fetch neighbourhood ──────────────────────────────────────────
     async function fetchNeighbourhood(entryId: string) {
+        loadAbort.abort();
+        const ctrl = new AbortController();
+        loadAbort = ctrl;
         loading = true;
         errorMsg = null;
+        citedIds = [];
+        citedByIds = [];
         citedPapers = [];
         citedByPapers = [];
+        citedRequested = 0;
+        citedByRequested = 0;
+        loadingMoreCited = false;
+        loadingMoreCitedBy = false;
         focusedId = null;
         expandedAbstracts = new Set();
         expandedNested = new Set();
@@ -219,146 +275,94 @@
         advancedFilterOpen = false;
 
         try {
-            const [citRes, refRes] = await Promise.all([
-                fetch(
-                    `${apiBaseUrl}/paper-citations/paper/${encodeURIComponent(entryId)}`,
-                ),
-                fetch(
-                    `${apiBaseUrl}/paper-references/paper/${encodeURIComponent(entryId)}`,
-                ),
-            ]);
-
-            const citationsRaw: { cited_paper_entry_id: string }[] = citRes.ok
-                ? await citRes.json()
-                : [];
-            const referencesRaw: { referenced_paper_entry_id: string }[] =
-                refRes.ok ? await refRes.json() : [];
-
-            const citedIds = citationsRaw.map((c) => c.cited_paper_entry_id);
-            const referencedIds = referencesRaw.map(
-                (r) => r.referenced_paper_entry_id,
+            const ids = await fetchNeighbourIds(apiBaseUrl, entryId, ctrl.signal);
+            const firstCited = ids.citedIds.slice(0, PAGE_SIZE);
+            const firstCitedBy = ids.referencedIds.slice(0, PAGE_SIZE);
+            const papers = await fetchNeighbourPapers(
+                apiBaseUrl,
+                [...firstCited, ...firstCitedBy],
+                ctrl.signal,
             );
-            const allIds = [...new Set([...citedIds, ...referencedIds])];
-
-            let realPapers: Record<string, NeighbourPaperItem> = {};
-            if (allIds.length > 0) {
-                const batchSize = 500;
-                const batches: string[][] = [];
-                for (let i = 0; i < allIds.length; i += batchSize) {
-                    batches.push(allIds.slice(i, i + batchSize));
-                }
-                const results = await Promise.all(
-                    batches.map((ids) =>
-                        fetch(`${apiBaseUrl}/papers/batch`, {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ entryIds: ids }),
-                        }).then((r) => (r.ok ? r.json() : [])),
-                    ),
-                );
-                results.flat().forEach((p: any) => {
-                    realPapers[p.entry_id] = {
-                        entry_id: p.entry_id,
-                        title: p.title ?? p.entry_id,
-                        authors: Array.isArray(p.authors)
-                            ? p.authors.join(", ")
-                            : (p.authors ?? ""),
-                        abstract: p.abstract ?? "",
-                        published: p.published ?? null,
-                        categories: p.categories ?? null,
-                        non_arxiv_citation_count: Number(
-                            p.non_arxiv_citation_count ?? 0,
-                        ),
-                        non_arxiv_reference_count: Number(
-                            p.non_arxiv_reference_count ?? 0,
-                        ),
-                    };
-                });
-            }
-
-            citedPapers = [...new Set(citedIds)]
-                .map((id) => realPapers[id])
-                .filter(Boolean);
-            citedByPapers = [...new Set(referencedIds)]
-                .map((id) => realPapers[id])
-                .filter(Boolean);
+            if (ctrl.signal.aborted) return;
+            citedIds = ids.citedIds;
+            citedByIds = ids.referencedIds;
+            citedRequested = firstCited.length;
+            citedByRequested = firstCitedBy.length;
+            citedPapers = pick(firstCited, papers);
+            citedByPapers = pick(firstCitedBy, papers);
             nonArxivCitations = paper.non_arxiv_citation_count ?? 0;
             nonArxivReferences = paper.non_arxiv_reference_count ?? 0;
         } catch (e) {
+            if (ctrl.signal.aborted) return;
             errorMsg =
                 e instanceof Error
                     ? e.message
                     : "Failed to load neighbourhood.";
         } finally {
-            loading = false;
+            if (loadAbort === ctrl) loading = false;
+        }
+    }
+
+    async function loadMore(which: "cited" | "citedBy") {
+        const ctrl = loadAbort;
+        const all = which === "cited" ? citedIds : citedByIds;
+        const from = which === "cited" ? citedRequested : citedByRequested;
+        const next = all.slice(from, from + PAGE_SIZE);
+        if (!next.length) return;
+        if (which === "cited") loadingMoreCited = true;
+        else loadingMoreCitedBy = true;
+        try {
+            const papers = await fetchNeighbourPapers(
+                apiBaseUrl,
+                next,
+                ctrl.signal,
+            );
+            if (ctrl.signal.aborted) return;
+            if (which === "cited") {
+                citedPapers = [...citedPapers, ...pick(next, papers)];
+                citedRequested = from + next.length;
+            } else {
+                citedByPapers = [...citedByPapers, ...pick(next, papers)];
+                citedByRequested = from + next.length;
+            }
+        } catch {
+            /* abgebrochen oder Netzwerkfehler: Button bleibt verfügbar */
+        } finally {
+            if (!ctrl.signal.aborted) {
+                if (which === "cited") loadingMoreCited = false;
+                else loadingMoreCitedBy = false;
+            }
         }
     }
 
     // ─── nested data for focused item ────────────────────────────────
     async function fetchNested(entryId: string) {
         if (nestedData[entryId] !== undefined) return;
+        const ctrl = loadAbort;
         nestedData = {
             ...nestedData,
             [entryId]: { cites: [], citedBy: [], loading: true },
         };
         try {
-            const [citRes, refRes] = await Promise.all([
-                fetch(
-                    `${apiBaseUrl}/paper-citations/paper/${encodeURIComponent(entryId)}`,
-                ),
-                fetch(
-                    `${apiBaseUrl}/paper-references/paper/${encodeURIComponent(entryId)}`,
-                ),
-            ]);
-            const citationsRaw: { cited_paper_entry_id: string }[] = citRes.ok
-                ? await citRes.json()
-                : [];
-            const referencesRaw: { referenced_paper_entry_id: string }[] =
-                refRes.ok ? await refRes.json() : [];
-            const citedIds = citationsRaw
-                .map((c) => c.cited_paper_entry_id)
-                .slice(0, 20);
-            const citedByIds = referencesRaw
-                .map((r) => r.referenced_paper_entry_id)
-                .slice(0, 20);
-            const allIds = [...new Set([...citedIds, ...citedByIds])];
-            let realPapers: Record<string, NeighbourPaperItem> = {};
-            if (allIds.length > 0) {
-                const raw = await fetch(`${apiBaseUrl}/papers/batch`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ entryIds: allIds }),
-                }).then((r) => (r.ok ? r.json() : []));
-                raw.forEach((p: any) => {
-                    realPapers[p.entry_id] = {
-                        entry_id: p.entry_id,
-                        title: p.title ?? p.entry_id,
-                        authors: Array.isArray(p.authors)
-                            ? p.authors.join(", ")
-                            : (p.authors ?? ""),
-                        abstract: p.abstract ?? "",
-                        published: p.published ?? null,
-                        categories: p.categories ?? null,
-                        non_arxiv_citation_count: Number(
-                            p.non_arxiv_citation_count ?? 0,
-                        ),
-                        non_arxiv_reference_count: Number(
-                            p.non_arxiv_reference_count ?? 0,
-                        ),
-                    };
-                });
-            }
+            const ids = await fetchNeighbourIds(apiBaseUrl, entryId, ctrl.signal);
+            const nCited = ids.citedIds.slice(0, 20);
+            const nCitedBy = ids.referencedIds.slice(0, 20);
+            const papers = await fetchNeighbourPapers(
+                apiBaseUrl,
+                [...nCited, ...nCitedBy],
+                ctrl.signal,
+            );
+            if (ctrl.signal.aborted) return;
             nestedData = {
                 ...nestedData,
                 [entryId]: {
-                    cites: citedIds.map((id) => realPapers[id]).filter(Boolean),
-                    citedBy: citedByIds
-                        .map((id) => realPapers[id])
-                        .filter(Boolean),
+                    cites: pick(nCited, papers),
+                    citedBy: pick(nCitedBy, papers),
                     loading: false,
                 },
             };
         } catch {
+            if (ctrl.signal.aborted) return;
             nestedData = {
                 ...nestedData,
                 [entryId]: { cites: [], citedBy: [], loading: false },
@@ -436,6 +440,8 @@
         if (paper?.entry_id) fetchNeighbourhood(paper.entry_id);
     });
 
+    onDestroy(() => loadAbort.abort());
+
     $: abstractSnippet = paper?.abstract
         ? paper.abstract.length > 250
             ? paper.abstract.slice(0, 250) + "…"
@@ -443,8 +449,9 @@
         : "No abstract available.";
 
     // filtered lists
-    $: filteredCited = applyFilter(citedPapers);
-    $: filteredCitedBy = applyFilter(citedByPapers);
+    // nFilter explizit übergeben, damit Svelte die Abhängigkeit trackt
+    $: filteredCited = applyFilter(citedPapers, nFilter);
+    $: filteredCitedBy = applyFilter(citedByPapers, nFilter);
 </script>
 
 <!-- toggle button -->
@@ -572,7 +579,7 @@
                 >
                 <span class="filter-count">
                     {filteredCited.length + filteredCitedBy.length} of {citedPapers.length +
-                        citedByPapers.length} shown
+                        citedByPapers.length} loaded shown
                 </span>
             </div>
             {#if filterBadges.length > 0}
@@ -610,13 +617,13 @@
             <!-- citation/reference stats -->
             <div class="stats-row">
                 <span class="stat-badge citation-stat" title="arXiv citations">
-                    {citedPapers.length} Citations
+                    {citedIds.length} Citations
                 </span>
                 <span
                     class="stat-badge reference-stat"
                     title="arXiv references"
                 >
-                    {citedByPapers.length} References
+                    {citedByIds.length} References
                 </span>
                 {#if (paper.non_arxiv_citation_count ?? 0) > 0 || (paper.non_arxiv_reference_count ?? 0) > 0}
                     <span
@@ -667,9 +674,9 @@
                     >
                         <span class="section-dot citation-dot"></span>
                         <span class="section-title">
-                            Citations ({filteredCited.length}{hasActiveFilter &&
-                            filteredCited.length !== citedPapers.length
-                                ? `/${citedPapers.length}`
+                            Citations ({filteredCited.length}{filteredCited.length !==
+                            citedIds.length
+                                ? `/${citedIds.length}`
                                 : ""}{nonArxivCitations > 0
                                 ? ` + ${nonArxivCitations} non-arXiv`
                                 : ""})
@@ -841,6 +848,17 @@
                                     </div>
                                 </div>
                             {/each}
+                            {#if citedRequested < citedIds.length}
+                                <button
+                                    class="load-more-btn"
+                                    disabled={loadingMoreCited}
+                                    on:click={() => loadMore("cited")}
+                                >
+                                    {loadingMoreCited
+                                        ? "Loading…"
+                                        : `Load more (${citedIds.length - citedRequested} remaining)`}
+                                </button>
+                            {/if}
                             {#if filteredCited.length === 0}
                                 <p class="empty-msg">
                                     {citedPapers.length === 0
@@ -862,9 +880,9 @@
                     >
                         <span class="section-dot reference-dot"></span>
                         <span class="section-title">
-                            References ({filteredCitedBy.length}{hasActiveFilter &&
-                            filteredCitedBy.length !== citedByPapers.length
-                                ? `/${citedByPapers.length}`
+                            References ({filteredCitedBy.length}{filteredCitedBy.length !==
+                            citedByIds.length
+                                ? `/${citedByIds.length}`
                                 : ""}{nonArxivReferences > 0
                                 ? ` + ${nonArxivReferences} non-arXiv`
                                 : ""})
@@ -1037,6 +1055,17 @@
                                     </div>
                                 </div>
                             {/each}
+                            {#if citedByRequested < citedByIds.length}
+                                <button
+                                    class="load-more-btn"
+                                    disabled={loadingMoreCitedBy}
+                                    on:click={() => loadMore("citedBy")}
+                                >
+                                    {loadingMoreCitedBy
+                                        ? "Loading…"
+                                        : `Load more (${citedByIds.length - citedByRequested} remaining)`}
+                                </button>
+                            {/if}
                             {#if filteredCitedBy.length === 0}
                                 <p class="empty-msg">
                                     {citedByPapers.length === 0
@@ -1053,6 +1082,25 @@
 </div>
 
 <style>
+    .load-more-btn {
+        display: block;
+        width: 100%;
+        margin: 6px 0;
+        padding: 6px 10px;
+        font-size: 12px;
+        color: var(--text-secondary, #a8a8c8);
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid var(--border-subtle, rgba(147, 51, 234, 0.18));
+        border-radius: 8px;
+        cursor: pointer;
+    }
+    .load-more-btn:hover:not(:disabled) {
+        background: rgba(255, 255, 255, 0.08);
+    }
+    .load-more-btn:disabled {
+        opacity: 0.6;
+        cursor: default;
+    }
     /* ── toggle button ── */
     .sidebar-toggle {
         position: absolute;
