@@ -67,3 +67,15 @@ class Logger:
 
     def set_level(self, level: str):
         self.logger.setLevel(getattr(logging, level.upper()))
+
+
+def capture_library_logger(name: str, level: int = logging.INFO, log_path: str = "logs") -> logging.Logger:
+    """
+    Attaches the console + rotating file handlers to a third-party logger
+    (e.g. "apscheduler"), so its messages - most importantly the tracebacks of
+    failed scheduled jobs, which APScheduler logs itself instead of raising -
+    end up in the log files. Idempotent.
+    """
+    lib_logger = Logger(name, log_path).logger
+    lib_logger.setLevel(level)
+    return lib_logger

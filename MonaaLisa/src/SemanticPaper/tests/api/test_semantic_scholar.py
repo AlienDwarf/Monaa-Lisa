@@ -1,14 +1,14 @@
 import pytest
 from unittest.mock import Mock, patch
 
-from MonaaLisa.src.SemanticPaper.api.semantic_scholar import SemanticScholarAPI
+from MonaaLisa.src.SemanticPaper.api.semantic_scholar import RateLimiter, SemanticScholarAPI
 
 
 @pytest.fixture
 def semantic_scholar_api():
     """Creates a SemanticScholarAPI instance with mocked external dependencies."""
     with patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.Logger'):
-        api = SemanticScholarAPI(api_key="test_key")
+        api = SemanticScholarAPI(api_key="test_key", rate_limiter=RateLimiter(0))
         api.logger = Mock()
         return api
 
@@ -17,7 +17,7 @@ def semantic_scholar_api():
 def semantic_scholar_api_no_key():
     """Creates a SemanticScholarAPI instance without API key."""
     with patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.Logger'):
-        api = SemanticScholarAPI(api_key=None)
+        api = SemanticScholarAPI(api_key=None, rate_limiter=RateLimiter(0))
         api.logger = Mock()
         return api
 
@@ -356,9 +356,11 @@ class TestFetchBatch:
         """
         Tests: batching logic with batch_size smaller than total IDs
 
-        When there are more IDs than batch_size, multiple requests should be made
-        and time.sleep should be called between batches.
+        When there are more IDs than batch_size, multiple requests should be made,
+        each paced by the rate limiter (pause_seconds is ignored).
         """
+        limiter = Mock()
+        semantic_scholar_api.rate_limiter = limiter
         mock_response_1 = Mock()
         mock_response_1.raise_for_status = Mock()
         mock_response_1.json.return_value = [
@@ -390,7 +392,8 @@ class TestFetchBatch:
         )
 
         assert mock_post.call_count == 2
-        mock_sleep.assert_called_once_with(0.5)
+        assert limiter.wait.call_count == 2
+        mock_sleep.assert_not_called()
         assert len(found) == 2
         assert len(not_found) == 0
 
@@ -532,3 +535,65 @@ class TestFetchBatchDetailedRetries:
         found, not_found = semantic_scholar_api.fetch_batch(["2101.1"])
 
         assert found == [] and not_found == ["2101.1"]
+
+
+class TestRateLimiter:
+
+    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.time.sleep')
+    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.time.monotonic')
+    def test_spaces_requests(self, mock_mono, mock_sleep):
+        mock_mono.return_value = 100.0
+        limiter = RateLimiter(1.0)
+        limiter.wait()                 # first request: no wait
+        mock_sleep.assert_not_called()
+        mock_mono.return_value = 100.3
+        limiter.wait()                 # 0.3s later: must wait the remaining 0.7s
+        assert mock_sleep.call_args[0][0] == pytest.approx(0.7)
+
+    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.time.sleep')
+    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.time.monotonic', return_value=50.0)
+    def test_defer_pushes_next_slot(self, mock_mono, mock_sleep):
+        limiter = RateLimiter(1.0)
+        limiter.defer(30)
+        limiter.wait()
+        assert mock_sleep.call_args[0][0] == pytest.approx(30)
+
+    def test_clients_share_one_limiter_by_default(self):
+        with patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.Logger'):
+            assert SemanticScholarAPI("a").rate_limiter is SemanticScholarAPI(None).rate_limiter
+
+    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.time.sleep')
+    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.requests.post')
+    def test_long_retry_after_is_not_capped_at_60s(self, mock_post, mock_sleep, semantic_scholar_api):
+        mock_post.side_effect = [_resp(429, headers={"Retry-After": "300"}), _resp(200, [_FOUND_ITEM])]
+
+        found, _, _ = semantic_scholar_api.fetch_batch_detailed(["2101.1"])
+
+        assert len(found) == 1
+        mock_sleep.assert_any_call(300.0)
+
+
+class TestEmbeddingValidation:
+
+    @pytest.mark.parametrize("vector", [
+        [0.1] * 767,                    # wrong length
+        [0.1] * 769,
+        [0.1] * 767 + [None],           # null element
+        [0.1] * 767 + ["x"],            # non-numeric
+        [0.1] * 767 + [float("nan")],   # not finite
+        "not a list",
+        None,
+    ])
+    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.time.sleep')
+    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.requests.post')
+    def test_invalid_vectors_are_not_found(self, mock_post, mock_sleep, vector, semantic_scholar_api):
+        item = {"paperId": "s2", "embedding": {"vector": vector}, "citations": [], "references": []}
+        mock_post.return_value = _resp(200, [item])
+
+        found, not_found, failed = semantic_scholar_api.fetch_batch_detailed(["2101.1"])
+
+        assert found == [] and not_found == ["2101.1"] and failed == []
+
+    def test_valid_vector_with_ints_is_accepted(self):
+        item = {"paperId": "s2", "embedding": {"vector": [0] * 768}}
+        assert SemanticScholarAPI._parse_item("2101.1", item)["s2_id"] == "s2"

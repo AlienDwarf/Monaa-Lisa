@@ -4,6 +4,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import bindparam, case, create_engine, delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 from dotenv import load_dotenv
 from Database.db_models import (
@@ -19,9 +20,17 @@ logger = Logger("Database")
 
 # Placeholder title for papers whose arXiv metadata is unknown
 UNKNOWN_TITLE = "[Unknown]"
+# Legacy placeholder rows (created by an older pipeline, hidden by the backend).
+# They count as "not known yet" so the pipeline fetches and fills them in.
+STUB_TITLE = "[STUB] Pending Fetch"
 
 # DATABASE_URL remains env-driven for Docker; do not move into config.ini
 DATABASE_URL = os.environ.get("DATABASE_URL")
+_engine_kwargs = {}
+if make_url(DATABASE_URL).get_driver_name() == "psycopg2":
+    # executemany UPDATE/DELETE (update_paper_metadata) via psycopg2.extras.execute_batch
+    # instead of one round trip per row; INSERTs keep using multi-row VALUES.
+    _engine_kwargs["executemany_mode"] = "values_plus_batch"
 engine = create_engine(
     DATABASE_URL,
     pool_size=int(os.getenv("DB_POOL_SIZE", "10")),
@@ -30,6 +39,7 @@ engine = create_engine(
     pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "1800")),
     pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", "30")),
     future=True,
+    **_engine_kwargs,
 )
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, future=True)
 
@@ -107,84 +117,92 @@ def is_dataset_import_complete() -> bool:
 
 """
 Abstract: Returns the most recent published date across all papers.
-Returns: datetime | None
+          Served by paper_published_id_idx (published DESC, id DESC).
+Returns: datetime | None (None only if the table is empty)
+Raises on DB errors – a failed lookup must not look like an empty DB.
 """
 def get_newest_paper_date():
-    from sqlalchemy import func as sa_func
-    session = SessionLocal()
-    try:
-        result = session.query(sa_func.max(DBPaper.published)).scalar()
-        return result
-    except Exception as e:
-        logger.error(f"Failed to get newest paper date: {e}")
-        return None
-    finally:
-        session.close()
+    with engine.connect() as conn:
+        return conn.execute(select(func.max(DBPaper.__table__.c.published))).scalar()
 
 
 """
-Abstract: Returns the total number of papers in the DB.
-Returns: int
+Abstract: Returns the APPROXIMATE number of papers (planner statistics,
+          pg_class.reltuples). count(*) on a table with millions of rows is a
+          full scan; this value is only used for log output. For an emptiness
+          check use is_database_empty() (EXISTS-style LIMIT 1).
+Returns: int (0 if the table was never analysed)
+Raises on DB errors.
 """
 def get_paper_count() -> int:
-    session = SessionLocal()
-    try:
-        return session.query(DBPaper.id).count()
-    except Exception:
-        return 0
-    finally:
-        session.close()
+    with engine.connect() as conn:
+        est = conn.execute(
+            text("SELECT reltuples::bigint FROM pg_class WHERE oid = to_regclass('paper')")
+        ).scalar()
+    return max(int(est or 0), 0)
+
+
+# Columns of uncaught_paper the retry job needs (no ORM objects, no created_at etc.)
+_UNCAUGHT_COLS = ("id", "entry_id", "title", "authors", "abstract", "categories", "published", "url")
+UNCAUGHT_PAGE_SIZE = 5000
 
 
 """
-Abstract: Returns uncaught papers whose last_checked is older than the given
-          interval (or was never checked), limited to those below max_retries.
-          Papers that reached max_retries stay in the table ("parked") and are
-          no longer returned – they are kept on purpose instead of being deleted,
-          so no paper silently disappears from the system.
+Abstract: Yields uncaught papers that are due for a retry, page by page
+          (keyset pagination on id, ``page_size`` rows per query, only the
+          needed columns as plain dicts). Due = below max_retries and never
+          checked or last checked before the cutoff. Papers that reached
+          max_retries stay in the table ("parked") and are not returned.
+          The cutoff is fixed when iteration starts, and the keyset cursor
+          only moves forward, so rows updated during the run (retry counter,
+          last_checked) are never returned twice. Each page uses its own
+          short-lived connection – no transaction stays open while the caller
+          talks to SemanticScholar.
+          Index: uncaught_paper_retry_id_idx ON uncaught_paper(id)
+                 WHERE retry_count < max_retries
 Args:
 - retry_interval_days: minimum days since last check
-Returns: list[DBUncaughtPaper]
+- page_size: rows per page
+Yields: list[dict] with keys id, entry_id, title, authors, abstract,
+        categories, published, url
+Raises on DB errors.
 """
-def get_uncaught_papers_due(retry_interval_days: int = 14) -> list:
-    session = SessionLocal()
-    try:
-        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=retry_interval_days)
-        rows = (
-            session.query(DBUncaughtPaper)
-            .filter(DBUncaughtPaper.retry_count < DBUncaughtPaper.max_retries)
-            .filter(
-                (DBUncaughtPaper.last_checked.is_(None)) | (DBUncaughtPaper.last_checked <= cutoff)
-            )
-            .all()
+def iter_uncaught_papers_due(retry_interval_days: int = 14, page_size: int = UNCAUGHT_PAGE_SIZE):
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=retry_interval_days)
+    t = DBUncaughtPaper.__table__
+    cols = [t.c[c] for c in _UNCAUGHT_COLS]
+    last_id = 0
+    while True:
+        stmt = (
+            select(*cols)
+            .where(t.c.retry_count < t.c.max_retries)
+            .where((t.c.last_checked.is_(None)) | (t.c.last_checked < cutoff))
+            .where(t.c.id > last_id)
+            .order_by(t.c.id)
+            .limit(page_size)
         )
-        # Detach from session so caller can use them freely
-        session.expunge_all()
-        return list(rows)
-    except Exception as e:
-        logger.error(f"Failed to query uncaught papers: {e}")
-        return []
-    finally:
-        session.close()
+        with engine.connect() as conn:
+            page = [dict(r._mapping) for r in conn.execute(stmt)]
+        if not page:
+            return
+        last_id = page[-1]["id"]
+        yield page
+        if len(page) < page_size:
+            return
 
 
 """
 Abstract: Counts uncaught papers that exhausted their retries (kept, not retried).
+          Only used for log output once per retry run.
 Returns: int
+Raises on DB errors.
 """
 def count_parked_uncaught() -> int:
-    session = SessionLocal()
-    try:
-        return (
-            session.query(DBUncaughtPaper.id)
-            .filter(DBUncaughtPaper.retry_count >= DBUncaughtPaper.max_retries)
-            .count()
-        )
-    except Exception as e:
-        logger.error(f"Failed to count parked uncaught papers: {e}")
-        return 0
-    finally:
-        session.close()
+    t = DBUncaughtPaper.__table__
+    with engine.connect() as conn:
+        return conn.execute(
+            select(func.count()).select_from(t).where(t.c.retry_count >= t.c.max_retries)
+        ).scalar() or 0
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +235,8 @@ Abstract: Returns the subset of the given entry_ids that already exist in the
           paper table or in the uncaught_paper table (one query per 5000 ids).
           Uncaught papers are handled by the retry job, so the incremental
           update must not send them to SemanticScholar again.
+          Legacy stub rows (title = STUB_TITLE) do not count as known.
+          Both lookups use the unique index on entry_id.
 Args:
 - entry_ids: list[str]
 Returns: set[str]
@@ -228,11 +248,14 @@ def get_known_entry_ids(entry_ids: list[str]) -> set[str]:
     unique_ids = list(dict.fromkeys(entry_ids))
     with engine.connect() as conn:
         for chunk in _chunks(unique_ids, _ID_CHUNK):
-            for table in (DBPaper.__table__, DBUncaughtPaper.__table__):
-                rows = conn.execute(
-                    select(table.c.entry_id).where(table.c.entry_id.in_(chunk))
-                )
-                known.update(r[0] for r in rows)
+            p = DBPaper.__table__
+            rows = conn.execute(
+                select(p.c.entry_id).where(p.c.entry_id.in_(chunk)).where(p.c.title != STUB_TITLE)
+            )
+            known.update(r[0] for r in rows)
+            u = DBUncaughtPaper.__table__
+            rows = conn.execute(select(u.c.entry_id).where(u.c.entry_id.in_(chunk)))
+            known.update(r[0] for r in rows)
     return known
 
 
@@ -277,7 +300,47 @@ def _refresh_citation_counts(conn, entry_ids: list[str]):
         )
 
 
+def _dedupe_by_entry_id(records: list[dict]) -> list[dict]:
+    """Keeps the last record per entry_id (ON CONFLICT DO UPDATE cannot touch a row twice)."""
+    return list({r["entry_id"]: r for r in records}.values())
+
+
+def _resolve_s2_id_collisions(conn, paper_rows: list[dict]):
+    """
+    paper.s2_id is UNIQUE. ON CONFLICT only handles entry_id, so an s2_id that
+    already belongs to ANOTHER paper (S2 merges arXiv versions/duplicates into
+    one paper) would abort the whole batch. The loser is stored with s2_id NULL
+    instead - one indexed lookup per 5000 ids (unique index on s2_id).
+    Duplicates inside the batch are resolved the same way (first one wins).
+    """
+    seen: set[str] = set()
+    for row in paper_rows:
+        sid = row.get("s2_id")
+        if sid is None:
+            continue
+        if sid in seen:
+            row["s2_id"] = None
+        else:
+            seen.add(sid)
+    if not seen:
+        return
+    t = DBPaper.__table__
+    owner: dict[str, str] = {}
+    for chunk in _chunks(list(seen), _ID_CHUNK):
+        for sid, eid in conn.execute(select(t.c.s2_id, t.c.entry_id).where(t.c.s2_id.in_(chunk))):
+            owner[sid] = eid
+    collisions = 0
+    for row in paper_rows:
+        sid = row.get("s2_id")
+        if sid is not None and owner.get(sid, row["entry_id"]) != row["entry_id"]:
+            row["s2_id"] = None
+            collisions += 1
+    if collisions:
+        logger.warning(f"{collisions} papers share their S2 id with another paper - stored without s2_id")
+
+
 def _save_processed_batch(conn, records: list[dict]):
+    records = _dedupe_by_entry_id(records)
     paper_rows = []
     embedding_rows = []
     citation_rows = []   # paper_citation(belonging = cited paper, cited_paper = citing paper)
@@ -327,6 +390,7 @@ def _save_processed_batch(conn, records: list[dict]):
             citation_rows.append({"belonging_paper_entry_id": rid, "cited_paper_entry_id": eid})
             touched_ids.append(rid)
 
+    _resolve_s2_id_collisions(conn, paper_rows)
     conn.execute(_paper_upsert_stmt(paper_rows))
 
     if embedding_rows:
@@ -346,6 +410,8 @@ Abstract: Saves fully processed papers (metadata + 128-D embedding + 2-D
           coordinates + citation/reference links) in ONE transaction.
           If the batch fails (e.g. one malformed record), it falls back to
           saving paper by paper so a single bad record cannot sink the batch.
+          Papers missing from the returned set could not be saved; callers
+          queue them as uncaught and count the attempt as a retry.
 Args:
 - records: list of dicts with keys entry_id, title, authors, abstract,
   categories, published, updated, doi, journal_ref, license, url, s2_id,
@@ -356,6 +422,7 @@ Returns: set[str] -> entry_ids that were saved
 def save_processed_papers(records: list[dict]) -> set[str]:
     if not records:
         return set()
+    records = _dedupe_by_entry_id(records)
     try:
         with engine.begin() as conn:
             _save_processed_batch(conn, records)
@@ -381,7 +448,9 @@ Abstract: Stores papers without SemanticScholar data for later retries.
 Args:
 - rows: list of dicts with keys entry_id, title, authors, abstract,
   categories, published, url, max_retries
-Returns: int -> number of rows passed in (0 on error)
+Returns: int -> number of rows passed in
+Raises on DB errors: the harvest must NOT advance its resumption token when
+the papers could not be queued, otherwise they would be lost for good.
 """
 def save_uncaught_papers(rows: list[dict]) -> int:
     if not rows:
@@ -397,60 +466,51 @@ def save_uncaught_papers(rows: list[dict]) -> int:
         "url": r.get("url"),
         "retry_count": 0,
         "max_retries": r.get("max_retries", 4),
-    } for r in rows]
-    try:
-        with engine.begin() as conn:
-            for chunk in _chunks(values, _LINK_CHUNK):
-                conn.execute(pg_insert(t).values(chunk).on_conflict_do_nothing(index_elements=[t.c.entry_id]))
-        return len(values)
-    except Exception as e:
-        logger.error(f"Failed to save {len(values)} uncaught papers: {e}")
-        return 0
+    } for r in _dedupe_by_entry_id(rows)]
+    with engine.begin() as conn:
+        for chunk in _chunks(values, _LINK_CHUNK):
+            conn.execute(pg_insert(t).values(chunk).on_conflict_do_nothing(index_elements=[t.c.entry_id]))
+    return len(values)
 
 
 """
 Abstract: Increments retry_count and sets last_checked for the given uncaught papers.
 Args:
 - entry_ids: list[str]
-Returns: bool
+Returns: True
+Raises on DB errors (the job fails visibly instead of silently retrying forever).
 """
 def increment_uncaught_retries(entry_ids: list[str]) -> bool:
+    entry_ids = list(dict.fromkeys(entry_ids))
     if not entry_ids:
         return True
     t = DBUncaughtPaper.__table__
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    try:
-        with engine.begin() as conn:
-            for chunk in _chunks(list(entry_ids), _ID_CHUNK):
-                conn.execute(
-                    update(t).where(t.c.entry_id.in_(chunk))
-                    .values(retry_count=t.c.retry_count + 1, last_checked=now)
-                )
-        return True
-    except Exception as e:
-        logger.error(f"Failed to increment retries for {len(entry_ids)} uncaught papers: {e}")
-        return False
+    with engine.begin() as conn:
+        for chunk in _chunks(entry_ids, _ID_CHUNK):
+            conn.execute(
+                update(t).where(t.c.entry_id.in_(chunk))
+                .values(retry_count=t.c.retry_count + 1, last_checked=now)
+            )
+    return True
 
 
 """
 Abstract: Removes uncaught papers (after they were successfully processed).
 Args:
 - entry_ids: list[str] | set[str]
-Returns: bool
+Returns: True
+Raises on DB errors.
 """
 def delete_uncaught_papers(entry_ids) -> bool:
     entry_ids = list(entry_ids)
     if not entry_ids:
         return True
     t = DBUncaughtPaper.__table__
-    try:
-        with engine.begin() as conn:
-            for chunk in _chunks(entry_ids, _ID_CHUNK):
-                conn.execute(delete(t).where(t.c.entry_id.in_(chunk)))
-        return True
-    except Exception as e:
-        logger.error(f"Failed to delete {len(entry_ids)} uncaught papers: {e}")
-        return False
+    with engine.begin() as conn:
+        for chunk in _chunks(entry_ids, _ID_CHUNK):
+            conn.execute(delete(t).where(t.c.entry_id.in_(chunk)))
+    return True
 
 
 """
@@ -460,14 +520,15 @@ Abstract: Updates metadata of papers that already exist (e.g. revised versions
           citation data are not touched. NULL values keep the stored value.
 Args:
 - records: list of dicts with entry_id and the metadata keys above
-Returns: int -> number of records sent (0 on error)
+Returns: int -> number of records sent
+Raises on DB errors (harvest must not advance past a page that was not applied).
 """
 def update_paper_metadata(records: list[dict]) -> int:
     if not records:
         return 0
     t = DBPaper.__table__
     rows = []
-    for r in records:
+    for r in _dedupe_by_entry_id(records):
         cats = split_categories(r.get("categories"))
         rows.append({
             "b_entry_id": r["entry_id"],
@@ -501,14 +562,10 @@ def update_paper_metadata(records: list[dict]) -> int:
             license=func.coalesce(bindparam("b_license"), t.c.license),
         )
     )
-    try:
-        with engine.begin() as conn:
-            for chunk in _chunks(rows, _LINK_CHUNK):
-                conn.execute(stmt, chunk)
-        return len(rows)
-    except Exception as e:
-        logger.error(f"Failed to update metadata of {len(rows)} papers: {e}")
-        return 0
+    with engine.begin() as conn:
+        for chunk in _chunks(rows, _LINK_CHUNK):
+            conn.execute(stmt, chunk)
+    return len(rows)
 
 
 # Wird beim Container-Start als Verbindungstest ausgeführt (docker-compose: python Database/db.py).

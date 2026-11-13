@@ -15,17 +15,18 @@ import sys
 import signal
 import faulthandler
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 
 from config import cfg
-from util.logger import Logger
+from util.logger import Logger, capture_library_logger
 from Database.db import (
     DATASET_IMPORT_COMPLETE,
     DATASET_IMPORT_KEY,
     engine,
+    get_app_state,
     is_database_empty,
     is_dataset_import_complete,
     set_app_state,
@@ -41,11 +42,35 @@ from SemanticPaper.data.downloader import (
 from SemanticPaper.data.importer import run_import
 from SemanticPaper.pipeline.embedding_pipeline import EmbeddingPipeline
 from SemanticPaper.pipeline.incremental import (
+    UNCAUGHT_RETRY_LAST_RUN,
     run_incremental_update,
     retry_uncaught_papers,
 )
 
 logger = Logger("Main")
+# APScheduler logs job exceptions on its own logger - route them to console + logs/apscheduler.log
+capture_library_logger("apscheduler")
+
+
+def _next_uncaught_retry(interval_days: int) -> datetime:
+    """
+    The scheduler is in-memory: a plain interval job would first run
+    ``interval_days`` after every restart, i.e. practically never on a host
+    that restarts more often. The last successful run is stored in app_state
+    instead; an overdue (or never run) retry starts right away.
+    """
+    now = datetime.now()
+    try:
+        last = get_app_state(UNCAUGHT_RETRY_LAST_RUN)
+        last_run = datetime.fromisoformat(last) if last else None
+    except Exception as e:
+        logger.warning(f"Could not read last uncaught retry run ({e}) - running it now")
+        last_run = None
+    if last_run is None:
+        return now
+    if last_run.tzinfo is not None:
+        last_run = last_run.astimezone().replace(tzinfo=None)   # local naive, like datetime.now()
+    return max(now, last_run + timedelta(days=interval_days))
 
 load_dotenv()
 
@@ -161,16 +186,24 @@ def main():
     )
     logger.info(f"Scheduled incremental update: every {update_interval_days} days")
 
-    # Uncaught paper retry
+    # Uncaught paper retry (shares a lock with the incremental update, so it
+    # waits instead of hitting SemanticScholar at the same time)
+    retry_first_run = _next_uncaught_retry(uncaught_interval_days)
     scheduler.add_job(
         retry_uncaught_papers,
         "interval",
         days=uncaught_interval_days,
+        next_run_time=retry_first_run,
         args=[s2_client, pipeline],
         id="uncaught_retry",
         max_instances=1,
+        coalesce=True,
+        misfire_grace_time=None,
     )
-    logger.info(f"Scheduled uncaught paper retry: every {uncaught_interval_days} days")
+    logger.info(
+        f"Scheduled uncaught paper retry: every {uncaught_interval_days} days "
+        f"(next run {retry_first_run:%Y-%m-%d %H:%M})"
+    )
 
     scheduler.start()
     logger.info("Scheduler started. System is running.")

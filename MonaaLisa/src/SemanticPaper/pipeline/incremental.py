@@ -16,7 +16,7 @@ Abstract: Implements the incremental update pipeline that keeps the database
         -> UMAP 128 -> 2-D
         -> save to ``paper`` + ``embedding``.
     5.  Papers without SemanticScholar data -> ``uncaught_paper`` table.
-    6.  Periodically retry uncaught papers; after max retries they are kept
+    6.  Periodically retry uncaught papers (page by page); after max retries they are kept
         ("parked") instead of deleted.
 
     Steps 3–5 run batch by batch (default 100 papers), so a crash loses at
@@ -25,6 +25,7 @@ Abstract: Implements the incremental update pipeline that keeps the database
 """
 
 import os
+import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 
@@ -42,7 +43,7 @@ from Database.db import (
     update_paper_metadata,
     save_processed_papers,
     save_uncaught_papers,
-    get_uncaught_papers_due,
+    iter_uncaught_papers_due,
     increment_uncaught_retries,
     delete_uncaught_papers,
     count_parked_uncaught,
@@ -54,8 +55,18 @@ logger = Logger("IncrementalPipeline")
 # app_state keys
 INCREMENTAL_STATE = "oai_incremental"
 BACKFILL_STATE = "oai_backfill"
+UNCAUGHT_RETRY_LAST_RUN = "uncaught_retry_last_run"
 # arXiv's OAI repository starts here (Identify -> earliestDatestamp)
 ARXIV_EARLIEST_DATESTAMP = date(2005, 9, 16)
+
+# Incremental update and uncaught retry are separate APScheduler jobs that may
+# fire at the same time. They share one SemanticScholar rate limit and write
+# the same tables, so only one of them does S2 work at a time (the other waits).
+_S2_JOB_LOCK = threading.Lock()
+
+
+class SemanticScholarUnavailable(RuntimeError):
+    """Several consecutive S2 batches failed completely - S2 is down or we are throttled."""
 
 
 # ------------------------------------------------------------------
@@ -132,21 +143,26 @@ def _queue_as_uncaught(records: list[dict]):
     save_uncaught_papers([{**r, "max_retries": max_retries} for r in records])
 
 
-def _metadata_from_uncaught(uncaught) -> dict:
+def _metadata_from_uncaught(uncaught: dict | None) -> dict:
     if uncaught is None:
         return {"title": UNKNOWN_TITLE}
     return {
-        "title": uncaught.title or UNKNOWN_TITLE,
-        "authors": uncaught.authors,
-        "abstract": uncaught.abstract,
-        "categories": uncaught.categories,
-        "published": uncaught.published,
-        "url": uncaught.url,
+        "title": uncaught.get("title") or UNKNOWN_TITLE,
+        "authors": uncaught.get("authors"),
+        "abstract": uncaught.get("abstract"),
+        "categories": uncaught.get("categories"),
+        "published": uncaught.get("published"),
+        "url": uncaught.get("url"),
     }
 
 
 def _s2_batch_size() -> int:
     return cfg.get_int("semanticpaper", "s2_batch_size", int(os.getenv("S2_BATCH_SIZE", "100")))
+
+
+def _s2_max_failed_batches() -> int:
+    return cfg.get_int("semanticpaper", "s2_max_consecutive_failed_batches",
+                       int(os.getenv("S2_MAX_CONSECUTIVE_FAILED_BATCHES", "3")))
 
 
 def _process_in_batches(arxiv_ids: list[str], metadata: dict[str, dict],
@@ -156,6 +172,13 @@ def _process_in_batches(arxiv_ids: list[str], metadata: dict[str, dict],
     Abstract: Streams the IDs through SemanticScholar -> PCA/UMAP -> DB in
         batches. Each batch is saved before the next one is requested, so a
         crash loses at most one batch and memory stays bounded.
+        A batch whose S2 request failed completely is held back. If the next
+        batch works again it was an isolated failure and is reported through
+        ``on_batch_done`` as usual. If ``s2_max_consecutive_failed_batches``
+        batches in a row fail completely, S2 is considered down and
+        SemanticScholarUnavailable is raised WITHOUT reporting the held-back
+        batches - callers neither queue nor count them, so an outage does
+        not use up retries and the OAI harvest does not advance.
     Args:
     - arxiv_ids: IDs to process
     - metadata: entry_id -> paper metadata dict (title, authors, ...)
@@ -163,11 +186,34 @@ def _process_in_batches(arxiv_ids: list[str], metadata: dict[str, dict],
     Returns: dict with lists ``saved``, ``not_found``, ``failed``
     """
     batch_size = max(1, _s2_batch_size())
+    max_failed_batches = max(1, _s2_max_failed_batches())
     totals = {"saved": [], "not_found": [], "failed": []}
+    held_back: list[list[str]] = []   # consecutive batches that failed completely
+
+    def report(saved, not_found, failed):
+        if on_batch_done:
+            on_batch_done(saved, not_found, failed)
+        totals["saved"].extend(saved)
+        totals["not_found"].extend(not_found)
+        totals["failed"].extend(failed)
+
+    def release_held_back():
+        for ids in held_back:
+            report(set(), [], ids)
+        held_back.clear()
 
     for start in range(0, len(arxiv_ids), batch_size):
         chunk = arxiv_ids[start:start + batch_size]
         found, not_found, failed = s2_client.fetch_batch_detailed(chunk, batch_size=batch_size)
+
+        if chunk and not found and not not_found:
+            held_back.append(list(chunk))
+            if len(held_back) >= max_failed_batches:
+                raise SemanticScholarUnavailable(
+                    f"{len(held_back)} consecutive SemanticScholar batches failed completely - aborting"
+                )
+            continue
+        release_held_back()
 
         saved: set[str] = set()
         if found:
@@ -194,18 +240,15 @@ def _process_in_batches(arxiv_ids: list[str], metadata: dict[str, dict],
                 # keep them for a later attempt instead of losing them
                 failed = list(failed) + unsaved
 
-        if on_batch_done:
-            on_batch_done(saved, not_found, failed)
-
-        totals["saved"].extend(saved)
-        totals["not_found"].extend(not_found)
-        totals["failed"].extend(failed)
+        report(saved, not_found, failed)
         logger.info(
             f"Progress: {min(start + batch_size, len(arxiv_ids))}/{len(arxiv_ids)} "
             f"(saved {len(totals['saved'])}, not found {len(totals['not_found'])}, "
             f"failed {len(totals['failed'])})"
         )
 
+    # fewer than the threshold at the very end: isolated failures, report them
+    release_held_back()
     return totals
 
 
@@ -225,6 +268,11 @@ def run_incremental_update(
     - s2_client: SemanticScholarAPI instance
     - pipeline: EmbeddingPipeline (PCA + UMAP)
     """
+    with _S2_JOB_LOCK:
+        return _run_incremental_update(oai_client, s2_client, pipeline)
+
+
+def _run_incremental_update(oai_client, s2_client, pipeline):
     logger.info("=== Incremental update started ===")
     t0 = time.time()
 
@@ -247,6 +295,8 @@ def run_incremental_update(
     def store_unprocessed(saved, not_found, failed, metadata):
         # Ohne S2-Daten (noch nicht bekannt oder Request fehlgeschlagen) ->
         # uncaught_paper; der Retry-Job versucht es später erneut.
+        # Ein DB-Fehler hier wirft bewusst: harvest() rückt dann den
+        # Resumption-Token nicht weiter, die Seite wird erneut geholt.
         missing = list(not_found) + list(failed)
         if missing:
             _queue_as_uncaught([{**metadata.get(eid, {}), "entry_id": eid} for eid in missing])
@@ -281,7 +331,7 @@ def run_incremental_update(
         f"already known: {totals['updated']} (metadata refreshed), new: {totals['new']} "
         f"(saved {totals['saved']}, uncaught {totals['not_found'] + totals['failed']}, "
         f"of which request failures {totals['failed']}), "
-        f"DB total: {paper_count_before} -> {get_paper_count()}"
+        f"DB total (estimate): ~{paper_count_before} -> ~{get_paper_count()}"
     )
     return totals
 
@@ -340,37 +390,63 @@ def retry_uncaught_papers(
     """
     Abstract: Asks SemanticScholar again for papers that were not available
         before. Found papers are saved and removed from uncaught_paper.
-        Papers S2 still does not know get their retry counter increased.
-        Request failures (rate limit, network) do NOT count as a retry.
-        Papers that reached max_retries are kept ("parked") instead of deleted,
-        so nothing silently disappears; they can be re-activated by resetting
+        Every other outcome counts as a retry (retry_count + 1, last_checked
+        = now): S2 still does not know the paper, the request for its batch
+        failed after all HTTP retries, or the paper could not be saved.
+        If S2 is down altogether (several consecutive batches fail
+        completely) the run stops WITHOUT counting the failed batch, so an
+        outage does not use up everyone's retries. Papers that reached
+        max_retries are kept ("parked") instead of deleted, so nothing
+        silently disappears; they can be re-activated by resetting
         retry_count.
+        The queue is read page by page (keyset pagination), so memory stays
+        bounded no matter how many papers are queued.
+        On success the run time is stored in app_state (see main.py: a
+        restart runs an overdue retry immediately).
     """
+    with _S2_JOB_LOCK:
+        return _retry_uncaught_papers(s2_client, pipeline)
+
+
+def _retry_uncaught_papers(s2_client, pipeline):
     retry_interval = cfg.get_int(
         "semanticpaper", "uncaught_retry_interval_days",
         int(os.getenv("UNCAUGHT_RETRY_INTERVAL_DAYS", "14"))
     )
+    page_size = cfg.get_int("semanticpaper", "uncaught_page_size",
+                            int(os.getenv("UNCAUGHT_PAGE_SIZE", "5000")))
 
     logger.info(f"=== Uncaught paper retry (interval: {retry_interval}d) ===")
-
-    due = get_uncaught_papers_due(retry_interval_days=retry_interval)
-    if not due:
-        logger.info("No uncaught papers due for retry.")
-        return
-
-    logger.info(f"{len(due)} uncaught papers due for retry")
-    metadata = {p.entry_id: _metadata_from_uncaught(p) for p in due}
+    started = datetime.now(timezone.utc)
 
     def update_uncaught(saved, not_found, failed):
         delete_uncaught_papers(saved)
-        increment_uncaught_retries(list(not_found))
+        increment_uncaught_retries(list(not_found) + list(failed))
 
-    totals = _process_in_batches([p.entry_id for p in due], metadata, s2_client, pipeline,
-                                 on_batch_done=update_uncaught)
+    totals = {"due": 0, "saved": 0, "not_found": 0, "failed": 0}
+    for page in iter_uncaught_papers_due(retry_interval_days=retry_interval, page_size=page_size):
+        totals["due"] += len(page)
+        metadata = {p["entry_id"]: _metadata_from_uncaught(p) for p in page}
+        logger.info(f"Retrying {len(page)} uncaught papers (total so far: {totals['due']})")
+        try:
+            result = _process_in_batches(list(metadata), metadata, s2_client, pipeline,
+                                         on_batch_done=update_uncaught)
+        except SemanticScholarUnavailable:
+            logger.error("SemanticScholar unavailable - uncaught retry aborted, will run again next time")
+            raise
+        totals["saved"] += len(result["saved"])
+        totals["not_found"] += len(result["not_found"])
+        totals["failed"] += len(result["failed"])
+
+    set_app_state(UNCAUGHT_RETRY_LAST_RUN, started.isoformat())
+    if not totals["due"]:
+        logger.info("No uncaught papers due for retry.")
+        return totals
 
     parked = count_parked_uncaught()
     logger.info(
-        f"=== Uncaught retry complete: rescued={len(totals['saved'])}, "
-        f"still missing={len(totals['not_found'])}, request failures={len(totals['failed'])}, "
+        f"=== Uncaught retry complete: due={totals['due']}, rescued={totals['saved']}, "
+        f"still missing={totals['not_found']}, request/save failures={totals['failed']}, "
         f"parked after max retries={parked} ==="
     )
+    return totals

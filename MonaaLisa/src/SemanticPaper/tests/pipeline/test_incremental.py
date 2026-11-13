@@ -12,6 +12,8 @@ sys.modules.setdefault("Database.db", MagicMock())
 from MonaaLisa.src.SemanticPaper.pipeline import incremental as incremental_module
 from MonaaLisa.src.SemanticPaper.pipeline.incremental import (
     INCREMENTAL_STATE,
+    UNCAUGHT_RETRY_LAST_RUN,
+    SemanticScholarUnavailable,
     backfill_missing_papers,
     harvest,
     run_incremental_update,
@@ -73,15 +75,22 @@ def _s2_found(arxiv_id="2401.00001", **extra):
 
 
 def _uncaught(entry_id, **fields):
-    u = Mock()
-    u.entry_id = entry_id
-    u.title = fields.get("title", "Test")
-    u.authors = fields.get("authors", "Author")
-    u.abstract = fields.get("abstract", "Abstract")
-    u.categories = fields.get("categories", "cs.AI")
-    u.published = fields.get("published", datetime(2024, 1, 1))
-    u.url = fields.get("url", f"http://arxiv.org/pdf/{entry_id}")
-    return u
+    """One row as yielded by iter_uncaught_papers_due() (plain dict, selected columns)."""
+    return {
+        "id": fields.get("id", 1),
+        "entry_id": entry_id,
+        "title": fields.get("title", "Test"),
+        "authors": fields.get("authors", "Author"),
+        "abstract": fields.get("abstract", "Abstract"),
+        "categories": fields.get("categories", "cs.AI"),
+        "published": fields.get("published", datetime(2024, 1, 1)),
+        "url": fields.get("url", f"http://arxiv.org/pdf/{entry_id}"),
+    }
+
+
+def _pages(*pages):
+    """side_effect for iter_uncaught_papers_due: yields the given pages."""
+    return lambda **kw: iter(pages)
 
 
 class TestHarvest:
@@ -270,31 +279,32 @@ class TestBackfillMissingPapers:
 class TestRetryUncaughtPapers:
     """Tests branching logic inside retry_uncaught_papers()."""
 
-    @patch(f"{MODULE}.get_uncaught_papers_due", return_value=[])
+    @patch(f"{MODULE}.iter_uncaught_papers_due", side_effect=_pages())
     @patch(f"{MODULE}.cfg")
     @patch(f"{MODULE}.logger")
-    def test_returns_early_when_no_papers_due(self, mock_logger, mock_cfg, mock_due):
-        """Nothing due → SemanticScholar must not be called."""
+    def test_returns_early_when_no_papers_due(self, mock_logger, mock_cfg, mock_due, state):
+        """Nothing due → SemanticScholar must not be called; the run is still recorded."""
         mock_cfg.get_int.return_value = 14
 
         s2_client = Mock()
         retry_uncaught_papers(s2_client, Mock())
 
         s2_client.fetch_batch_detailed.assert_not_called()
+        assert UNCAUGHT_RETRY_LAST_RUN in state
 
     @patch(f"{MODULE}.count_parked_uncaught", return_value=0)
     @patch(f"{MODULE}.increment_uncaught_retries")
     @patch(f"{MODULE}.delete_uncaught_papers")
     @patch(f"{MODULE}.save_processed_papers", return_value={"2401.00001"})
-    @patch(f"{MODULE}.get_uncaught_papers_due")
+    @patch(f"{MODULE}.iter_uncaught_papers_due")
     @patch(f"{MODULE}.cfg")
     @patch(f"{MODULE}.logger")
     def test_rescues_found_papers_and_deletes_from_uncaught(self, mock_logger, mock_cfg,
                                                              mock_due, mock_save,
                                                              mock_delete, mock_increment,
-                                                             mock_parked):
+                                                             mock_parked, state):
         """A paper S2 now knows is saved with its stored metadata and removed from uncaught."""
-        mock_due.return_value = [_uncaught("2401.00001", title="Stored title")]
+        mock_due.side_effect = _pages([_uncaught("2401.00001", title="Stored title")])
         mock_cfg.get_int.return_value = 100
 
         s2_client = Mock()
@@ -313,15 +323,16 @@ class TestRetryUncaughtPapers:
     @patch(f"{MODULE}.increment_uncaught_retries")
     @patch(f"{MODULE}.delete_uncaught_papers")
     @patch(f"{MODULE}.save_processed_papers", return_value=set())
-    @patch(f"{MODULE}.get_uncaught_papers_due")
+    @patch(f"{MODULE}.iter_uncaught_papers_due")
     @patch(f"{MODULE}.cfg")
     @patch(f"{MODULE}.logger")
-    def test_does_not_delete_or_count_retry_when_save_fails(self, mock_logger, mock_cfg,
-                                                            mock_due, mock_save,
-                                                            mock_delete, mock_increment,
-                                                            mock_parked):
-        """If saving fails, the paper stays in uncaught and does not lose a retry."""
-        mock_due.return_value = [_uncaught("2401.00001")]
+    def test_save_failure_keeps_paper_and_counts_retry(self, mock_logger, mock_cfg,
+                                                       mock_due, mock_save,
+                                                       mock_delete, mock_increment,
+                                                       mock_parked, state):
+        """If saving fails, the paper stays in uncaught but the attempt counts as a retry
+        (a paper that can never be saved must not be retried forever)."""
+        mock_due.side_effect = _pages([_uncaught("2401.00001")])
         mock_cfg.get_int.return_value = 100
 
         s2_client = Mock()
@@ -334,23 +345,23 @@ class TestRetryUncaughtPapers:
 
         deleted = mock_delete.call_args[0][0] if mock_delete.called else set()
         assert "2401.00001" not in deleted
-        incremented = mock_increment.call_args[0][0] if mock_increment.called else []
-        assert "2401.00001" not in incremented
+        mock_increment.assert_called_once_with(["2401.00001"])
 
     @patch(f"{MODULE}.count_parked_uncaught", return_value=0)
     @patch(f"{MODULE}.delete_uncaught_papers")
     @patch(f"{MODULE}.increment_uncaught_retries")
-    @patch(f"{MODULE}.get_uncaught_papers_due")
+    @patch(f"{MODULE}.iter_uncaught_papers_due")
     @patch(f"{MODULE}.cfg")
     @patch(f"{MODULE}.logger")
-    def test_increments_retry_only_for_not_found(self, mock_logger, mock_cfg,
-                                                 mock_due, mock_increment,
-                                                 mock_delete, mock_parked):
+    def test_not_found_and_isolated_request_failures_count_as_retry(self, mock_logger, mock_cfg,
+                                                                    mock_due, mock_increment,
+                                                                    mock_delete, mock_parked, state):
         """
         Still unknown to S2 → retry counter +1.
-        Request failed (rate limit / network) → NOT counted as a retry.
+        Request for a single paper failed after all HTTP retries → also +1,
+        otherwise it would be retried forever.
         """
-        mock_due.return_value = [_uncaught("2401.00001"), _uncaught("2401.00002")]
+        mock_due.side_effect = _pages([_uncaught("2401.00001"), _uncaught("2401.00002")])
         mock_cfg.get_int.return_value = 100
 
         s2_client = Mock()
@@ -358,4 +369,119 @@ class TestRetryUncaughtPapers:
 
         retry_uncaught_papers(s2_client, Mock())
 
-        mock_increment.assert_called_once_with(["2401.00001"])
+        mock_increment.assert_called_once_with(["2401.00001", "2401.00002"])
+
+    @patch(f"{MODULE}.count_parked_uncaught", return_value=0)
+    @patch(f"{MODULE}.delete_uncaught_papers")
+    @patch(f"{MODULE}.increment_uncaught_retries")
+    @patch(f"{MODULE}.iter_uncaught_papers_due")
+    @patch(f"{MODULE}.cfg")
+    @patch(f"{MODULE}.logger")
+    def test_s2_outage_aborts_without_counting_retries(self, mock_logger, mock_cfg, mock_due,
+                                                       mock_increment, mock_delete, mock_parked, state):
+        """3 batches in a row fail completely → abort, nobody loses a retry, run not recorded."""
+        mock_due.side_effect = _pages([_uncaught(str(i), id=i) for i in range(10)])
+        mock_cfg.get_int.side_effect = lambda section, key, default: {"s2_batch_size": 2}.get(key, 3)
+        s2_client = Mock()
+        s2_client.fetch_batch_detailed.side_effect = lambda ids, batch_size: ([], [], list(ids))
+
+        with pytest.raises(SemanticScholarUnavailable):
+            retry_uncaught_papers(s2_client, Mock())
+
+        assert s2_client.fetch_batch_detailed.call_count == 3
+        mock_increment.assert_not_called()
+        assert UNCAUGHT_RETRY_LAST_RUN not in state
+
+    @patch(f"{MODULE}.count_parked_uncaught", return_value=0)
+    @patch(f"{MODULE}.delete_uncaught_papers")
+    @patch(f"{MODULE}.increment_uncaught_retries")
+    @patch(f"{MODULE}.iter_uncaught_papers_due")
+    @patch(f"{MODULE}.cfg")
+    @patch(f"{MODULE}.logger")
+    def test_processes_queue_page_by_page(self, mock_logger, mock_cfg, mock_due,
+                                          mock_increment, mock_delete, mock_parked, state):
+        """Each page from the keyset iterator is processed on its own (bounded memory)."""
+        mock_due.side_effect = _pages([_uncaught("a", id=1), _uncaught("b", id=2)], [_uncaught("c", id=3)])
+        mock_cfg.get_int.return_value = 100
+        s2_client = Mock()
+        s2_client.fetch_batch_detailed.side_effect = lambda ids, batch_size: ([], list(ids), [])
+
+        totals = retry_uncaught_papers(s2_client, Mock())
+
+        assert [c[0][0] for c in s2_client.fetch_batch_detailed.call_args_list] == [["a", "b"], ["c"]]
+        assert totals["due"] == 3 and totals["not_found"] == 3
+
+
+class TestHarvestFailureSafety:
+
+    @patch(f"{MODULE}.save_uncaught_papers", side_effect=RuntimeError("db down"))
+    @patch(f"{MODULE}.update_paper_metadata")
+    @patch(f"{MODULE}.get_known_entry_ids", return_value=set())
+    @patch(f"{MODULE}.cfg")
+    @patch(f"{MODULE}.get_paper_count", return_value=100)
+    @patch(f"{MODULE}.logger")
+    def test_failed_uncaught_save_does_not_advance_token(self, mock_logger, mock_count, mock_cfg,
+                                                         mock_known, mock_update, mock_uncaught, state):
+        mock_cfg.get_int.return_value = 4
+        state[f"{INCREMENTAL_STATE}_from"] = "2026-10-20"
+        oai = FakeOAI([OAIPage([_rec("1")], [], "tok1"), OAIPage([_rec("2")], [], None)])
+        s2 = Mock()
+        s2.fetch_batch_detailed.side_effect = lambda ids, batch_size: ([], list(ids), [])
+
+        with pytest.raises(RuntimeError):
+            run_incremental_update(oai, s2, Mock())
+
+        assert not state.get(f"{INCREMENTAL_STATE}_token")        # page 1 not marked done
+        assert state[f"{INCREMENTAL_STATE}_from"] == "2026-10-20"  # start date unchanged
+
+    @patch(f"{MODULE}.update_paper_metadata", side_effect=RuntimeError("db down"))
+    @patch(f"{MODULE}.get_known_entry_ids", side_effect=lambda ids: set(ids))
+    @patch(f"{MODULE}.get_paper_count", return_value=100)
+    @patch(f"{MODULE}.logger")
+    def test_failed_metadata_update_does_not_advance_token(self, mock_logger, mock_count,
+                                                           mock_known, mock_update, state):
+        state[f"{INCREMENTAL_STATE}_from"] = "2026-10-20"
+        oai = FakeOAI([OAIPage([_rec("a")], [], "tok1"), OAIPage([_rec("b")], [], None)])
+
+        with pytest.raises(RuntimeError):
+            run_incremental_update(oai, Mock(), Mock())
+
+        assert not state.get(f"{INCREMENTAL_STATE}_token")
+
+    @patch(f"{MODULE}.save_uncaught_papers")
+    @patch(f"{MODULE}.update_paper_metadata")
+    @patch(f"{MODULE}.get_known_entry_ids", return_value=set())
+    @patch(f"{MODULE}.cfg")
+    @patch(f"{MODULE}.get_paper_count", return_value=100)
+    @patch(f"{MODULE}.logger")
+    def test_s2_outage_stops_harvest_without_queueing(self, mock_logger, mock_count, mock_cfg,
+                                                      mock_known, mock_update, mock_uncaught, state):
+        mock_cfg.get_int.side_effect = lambda section, key, default: {"s2_batch_size": 1}.get(key, 3)
+        state[f"{INCREMENTAL_STATE}_from"] = "2026-10-20"
+        oai = FakeOAI([OAIPage([_rec("1"), _rec("2"), _rec("3"), _rec("4")], [], "tok1")])
+        s2 = Mock()
+        s2.fetch_batch_detailed.side_effect = lambda ids, batch_size: ([], [], list(ids))
+
+        with pytest.raises(SemanticScholarUnavailable):
+            run_incremental_update(oai, s2, Mock())
+
+        mock_uncaught.assert_not_called()
+        assert not state.get(f"{INCREMENTAL_STATE}_token")
+
+
+class TestJobLock:
+
+    def test_jobs_share_one_lock(self):
+        import threading
+        lock = incremental_module._S2_JOB_LOCK
+        with patch(f"{MODULE}._retry_uncaught_papers") as inner:
+            lock.acquire()          # "incremental update is running"
+            try:
+                t = threading.Thread(target=retry_uncaught_papers, args=(Mock(), Mock()))
+                t.start()
+                t.join(0.2)
+                assert t.is_alive() and not inner.called   # waits for the running job
+            finally:
+                lock.release()
+            t.join(2)
+            assert inner.called

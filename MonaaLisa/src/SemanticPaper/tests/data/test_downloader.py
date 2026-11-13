@@ -621,7 +621,55 @@ class TestAtomicDownloadAndChecksum:
 
         assert _download_http("https://example.com/f", tmp_dest, "test") is False
         assert not tmp_dest.exists()
-        assert not tmp_dest.with_name(tmp_dest.name + ".part").exists()
+        # the partial data is kept for a Range resume
+        assert tmp_dest.with_name(tmp_dest.name + ".part").stat().st_size == 60
+
+    @patch(f"{MOD}.requests.get")
+    def test_resumes_part_file_with_range_request(self, mock_get, tmp_dest):
+        from MonaaLisa.src.SemanticPaper.data.downloader import _download_http
+
+        tmp_dest.with_name(tmp_dest.name + ".part").write_bytes(b"a" * 60)
+        resp = Mock()
+        resp.status_code = 206
+        resp.headers = {"content-length": "40", "content-range": "bytes 60-99/100"}
+        resp.iter_content.return_value = [b"b" * 40]
+        resp.raise_for_status = Mock()
+        mock_get.return_value = resp
+
+        assert _download_http("https://example.com/f", tmp_dest, "test") is True
+        assert mock_get.call_args.kwargs["headers"] == {"Range": "bytes=60-"}
+        assert tmp_dest.read_bytes() == b"a" * 60 + b"b" * 40
+
+    @patch(f"{MOD}.requests.get")
+    def test_server_ignoring_range_restarts_from_scratch(self, mock_get, tmp_dest):
+        from MonaaLisa.src.SemanticPaper.data.downloader import _download_http
+
+        tmp_dest.with_name(tmp_dest.name + ".part").write_bytes(b"a" * 60)
+        resp = Mock()
+        resp.status_code = 200
+        resp.headers = {"content-length": "100"}
+        resp.iter_content.return_value = [b"c" * 100]
+        resp.raise_for_status = Mock()
+        mock_get.return_value = resp
+
+        assert _download_http("https://example.com/f", tmp_dest, "test") is True
+        assert tmp_dest.read_bytes() == b"c" * 100
+
+    def test_verified_checksum_is_cached_until_file_changes(self, tmp_path):
+        import hashlib
+        from MonaaLisa.src.SemanticPaper.data import downloader
+
+        f = tmp_path / "umap.pkl"
+        f.write_bytes(b"model")
+        digest = hashlib.sha256(b"model").hexdigest()
+
+        assert downloader._checksum_ok(f, digest, "UMAP") is True
+        with patch(f"{MOD}._sha256") as mock_hash:
+            assert downloader._checksum_ok(f, digest, "UMAP") is True
+            mock_hash.assert_not_called()                      # second start: no re-hash
+
+        f.write_bytes(b"other content")                         # size/mtime change
+        assert downloader._checksum_ok(f, digest, "UMAP") is False
 
     @patch(f"{MOD}.requests.get")
     def test_crash_during_download_leaves_only_part_file(self, mock_get, tmp_dest):
