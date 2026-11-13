@@ -17,14 +17,19 @@ import {
   Patch,
   Post,
   Query,
+  Req,
+  Res,
   UseGuards,
 } from '@nestjs/common';
+import type { Request, Response } from 'express';
 import { AdminTokenGuard } from '../auth/admin-token.guard';
 import { PapersService } from './papers.service';
 import { CreatePaperDto } from './dto/create-paper.dto';
 import { UpdatePaperDto } from './dto/update-paper.dto';
 import {
   AuthorIdsQueryDto,
+  BatchPapersDto,
+  FilteredNeighboursDto,
   PointsQueryDto,
   QueryPaperDto,
 } from './dto/query-paper.dto';
@@ -63,8 +68,8 @@ export class PapersController {
    * Batch-Fetch: holt mehrere Papers anhand einer Liste von `entry_id`s.
    */
   @Post('batch')
-  findBatch(@Body() body: { entryIds: string[] }) {
-    return this.papers.findByEntryIds(body.entryIds ?? []);
+  findBatch(@Body() body: BatchPapersDto) {
+    return this.papers.findByEntryIds(body.entryIds);
   }
 
   // Nick - November 2025
@@ -95,9 +100,25 @@ export class PapersController {
    * Daten ändern sich nur beim (monatlichen) Pipeline-Update → cachebar.
    */
   @Get('points')
-  @Header('Cache-Control', 'public, max-age=3600')
-  findPoints(@Query() q: PointsQueryDto) {
-    return this.papers.findPoints(q.category, q.limit);
+  async findPoints(
+    @Query() q: PointsQueryDto,
+    @Req() req: Request,
+    @Res() res: Response,
+  ) {
+    // Fertige Bytes aus dem Server-Cache: kein erneutes Abfragen,
+    // Serialisieren oder Komprimieren pro Request.
+    const payload = await this.papers.getPointsPayload(q.category, q.limit);
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.setHeader('Vary', 'Accept-Encoding');
+    if (/\bgzip\b/.test(req.headers['accept-encoding'] ?? '')) {
+      // Content-Encoding gesetzt → compression-Middleware komprimiert nicht erneut
+      res.setHeader('Content-Encoding', 'gzip');
+      res.setHeader('Content-Length', payload.gz.length);
+      res.end(payload.gz);
+    } else {
+      res.end(payload.json);
+    }
   }
 
   /**
@@ -136,7 +157,7 @@ export class PapersController {
   }
 
   @Post('neighbours/filtered')
-  async getNeighbours(@Body() body: { entryIds: string[]; filter: any }) {
+  async getNeighbours(@Body() body: FilteredNeighboursDto) {
     return this.papers.findFilteredNeighbours(body.entryIds, body.filter);
   }
 

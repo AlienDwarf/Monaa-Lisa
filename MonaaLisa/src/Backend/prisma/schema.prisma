@@ -45,9 +45,21 @@ model Paper {
   category_list             String[]  @default([])
   arxiv_citation_count      Int       @default(0)
 
+  // UMAP-Koordinaten als echte Spalten. In der DB als
+  // GENERATED ALWAYS AS (...) STORED aus `tsne` berechnet
+  // (Migration 20261113120000) → NIE selbst schreiben, nur lesen.
+  point_x                   Float?    @db.Real
+  point_y                   Float?    @db.Real
+
   // Optimale Suchindizes
-  // Für schnelle Sortierung
-  @@index([published(sort: Desc)])
+  // Für schnelle, stabile Sortierung (published DESC, id DESC)
+  @@index([published(sort: Desc), id(sort: Desc)], map: "paper_published_id_idx")
+
+  // Präfix-Filter auf primary_category (LIKE 'cs.%')
+  @@index([primary_category(ops: raw("text_pattern_ops"))], map: "paper_primary_category_idx")
+  // Hinweis: paper_points_prefix_idx (partieller Covering-Index für
+  // GET /papers/points) ist nur in der Migration definiert, weil Prisma
+  // INCLUDE und WHERE nicht abbilden kann.
 
   // Um Kategorien zu durchsuchen (Freitext; für Filter category_list nutzen)
   @@index([categories(ops: raw("gin_trgm_ops"))], type: Gin)
@@ -165,5 +177,7 @@ model UncaughtPaper {
   last_checked DateTime?
   created_at   DateTime  @default(now())
 
+  // Hinweis: uncaught_paper_retry_id_idx (partiell: retry_count < max_retries)
+  // ist nur in der Migration definiert.
   @@map("uncaught_paper")
 }

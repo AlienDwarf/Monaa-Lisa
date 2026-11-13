@@ -2,9 +2,10 @@
  * Nico August 2025
  */
 import { ValidationPipe } from '@nestjs/common';
-import { NestFactory } from '@nestjs/core';
+import { HttpAdapterHost, NestFactory } from '@nestjs/core';
 import compression from 'compression';
 import { AppModule } from './app.module';
+import { PrismaExceptionFilter } from './common/prisma-exception.filter';
 
 type EnvAccessor = {
   process?: {
@@ -33,6 +34,14 @@ async function bootstrap() {
       whitelist: true,
     }),
   );
+
+  // Prisma-Fehler wie "nicht gefunden" als 404 statt 500
+  app.useGlobalFilters(
+    new PrismaExceptionFilter(app.get(HttpAdapterHost).httpAdapter),
+  );
+
+  // Sauber herunterfahren (offene DB-Verbindungen schließen) bei SIGTERM
+  app.enableShutdownHooks();
 
   // gzip für JSON-Antworten – die Punktwolke ganzer Kategorien schrumpft
   // dadurch auf etwa ein Drittel.

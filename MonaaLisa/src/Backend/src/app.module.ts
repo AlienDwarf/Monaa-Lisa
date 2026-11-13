@@ -4,6 +4,7 @@
 import { Module } from '@nestjs/common';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
+import { HealthController } from './health.controller';
 import { PrismaModule } from './prisma/prisma.module';
 import { PapersModule } from './papers/papers.module';
 import { PaperCitationsModule } from './paper-citations/paper-citations.module';
@@ -18,8 +19,8 @@ import { PaperReferencesModule } from './paper-references/paper-references.modul
     PaperCitationsModule,
     PaperReferencesModule,
   ], // andere @Module die intern benötigt werden
-  // AppController liefert GET / – wird vom Docker-Healthcheck genutzt
-  controllers: [AppController],
+  // HealthController liefert GET /health (inkl. DB-Check) für Docker
+  controllers: [AppController, HealthController],
   // PrismaService/PapersService hier NICHT erneut eintragen: das würde eine
   // zweite PrismaClient-Instanz mit eigenem Connection-Pool erzeugen.
   providers: [AppService],
