@@ -4,6 +4,8 @@
 
 **A tool for visualizing Open Access literature, developed as part of the 2025 Software Project at Hochschule Bochum (Bochum University of Applied Sciences).**
 
+![Monaa-Lisa overview: category map, paper map, citation graph and relation view](docs/figures/monaa-lisa-workflow.png)
+
 ## Quickstart (Development)
 
 **Note:**
