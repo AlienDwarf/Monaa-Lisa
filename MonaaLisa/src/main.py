@@ -5,7 +5,7 @@ New flow:
     1. First run -> download dataset + models from Google Drive -> import into DB
     2. Every run  -> ensure pre-trained models (PCA + UMAP) are present
     3. Load the EmbeddingPipeline (768 ->128 ->2D)
-    4. Run an immediate incremental update (arXiv gap-fill)
+    4. Run an immediate incremental update (arXiv OAI-PMH harvest since last run)
     5. Schedule monthly incremental updates and bi-weekly uncaught-paper retries
     6. Wait for shutdown signal
 """
@@ -31,7 +31,7 @@ from Database.db import (
     set_app_state,
 )
 from SemanticPaper.api.semantic_scholar import SemanticScholarAPI
-from SemanticPaper.api.arxiv import ArxivAPI
+from SemanticPaper.api.arxiv_oai import ArxivOAIClient
 from SemanticPaper.data.downloader import (
     ensure_all_downloaded,
     ensure_models_exist,
@@ -132,7 +132,10 @@ def main():
     # ---- 4. Initialise API clients ----
     api_key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "")
     s2_client = SemanticScholarAPI(api_key if api_key else None)
-    arxiv_client = ArxivAPI()
+    # arXiv OAI-PMH (offizielle Schnittstelle für Massen-/Inkrementell-Abgleich)
+    oai_client = ArxivOAIClient(
+        delay_seconds=cfg.get_float("semanticpaper", "oai_delay_seconds", 3.0),
+    )
 
     # ---- 5. Schedule periodic tasks ----
     update_interval_days = cfg.get_int(
@@ -152,7 +155,7 @@ def main():
         "interval",
         days=update_interval_days,
         next_run_time=datetime.now(),
-        args=[arxiv_client, s2_client, pipeline],
+        args=[oai_client, s2_client, pipeline],
         id="incremental_update",
         max_instances=1,
     )

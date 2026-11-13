@@ -2,7 +2,7 @@ import os
 import re
 import sys
 from datetime import datetime, timedelta, timezone
-from sqlalchemy import case, create_engine, delete, func, select, text, update
+from sqlalchemy import bindparam, case, create_engine, delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import sessionmaker
 from dotenv import load_dotenv
@@ -451,6 +451,64 @@ def delete_uncaught_papers(entry_ids) -> bool:
     except Exception as e:
         logger.error(f"Failed to delete {len(entry_ids)} uncaught papers: {e}")
         return False
+
+
+"""
+Abstract: Updates metadata of papers that already exist (e.g. revised versions
+          harvested via OAI-PMH): title, authors, abstract, categories, latest
+          version date, DOI, journal-ref, license. Coordinates, embeddings and
+          citation data are not touched. NULL values keep the stored value.
+Args:
+- records: list of dicts with entry_id and the metadata keys above
+Returns: int -> number of records sent (0 on error)
+"""
+def update_paper_metadata(records: list[dict]) -> int:
+    if not records:
+        return 0
+    t = DBPaper.__table__
+    rows = []
+    for r in records:
+        cats = split_categories(r.get("categories"))
+        rows.append({
+            "b_entry_id": r["entry_id"],
+            "b_title": r.get("title"),
+            "b_authors": r.get("authors"),
+            "b_abstract": r.get("abstract"),
+            "b_categories": " ".join(cats) if cats else None,
+            "b_primary_category": cats[0] if cats else None,
+            "b_category_list": cats or None,
+            "b_published": _to_naive_utc(r.get("published")),
+            "b_updated": _to_naive_utc(r.get("updated")),
+            "b_doi": r.get("doi"),
+            "b_journal_ref": r.get("journal_ref"),
+            "b_license": r.get("license"),
+        })
+    stmt = (
+        update(t)
+        .where(t.c.entry_id == bindparam("b_entry_id"))
+        .values(
+            title=func.coalesce(bindparam("b_title"), t.c.title),
+            authors=func.coalesce(bindparam("b_authors"), t.c.authors),
+            abstract=func.coalesce(bindparam("b_abstract"), t.c.abstract),
+            categories=func.coalesce(bindparam("b_categories"), t.c.categories),
+            primary_category=func.coalesce(bindparam("b_primary_category"), t.c.primary_category),
+            category_list=func.coalesce(bindparam("b_category_list", type_=t.c.category_list.type), t.c.category_list),
+            # Erstveröffentlichung nur setzen, wenn sie fehlt
+            published=func.coalesce(t.c.published, bindparam("b_published")),
+            updated=func.coalesce(bindparam("b_updated"), t.c.updated),
+            doi=func.coalesce(bindparam("b_doi"), t.c.doi),
+            journal_ref=func.coalesce(bindparam("b_journal_ref"), t.c.journal_ref),
+            license=func.coalesce(bindparam("b_license"), t.c.license),
+        )
+    )
+    try:
+        with engine.begin() as conn:
+            for chunk in _chunks(rows, _LINK_CHUNK):
+                conn.execute(stmt, chunk)
+        return len(rows)
+    except Exception as e:
+        logger.error(f"Failed to update metadata of {len(rows)} papers: {e}")
+        return 0
 
 
 # Wird beim Container-Start als Verbindungstest ausgeführt (docker-compose: python Database/db.py).

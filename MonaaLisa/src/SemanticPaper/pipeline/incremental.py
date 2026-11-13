@@ -4,43 +4,42 @@ Abstract: Implements the incremental update pipeline that keeps the database
 
     Flow
     ────
-    1.  Query the DB for the most recent ``published`` date.
-    2.  Fetch every paper published on arXiv after that date.
-    3.  Filter out papers already in the DB (by entry_id).
-    4.  Batch-request SemanticScholar for SPECTER v2 embeddings (768-D),
-        citations, and references.
-    5.  For papers with embeddings:
-        -> PCA 768
-        -> 128-D  
-        -> UMAP 128
-        -> 2-D  
+    1.  Harvest every arXiv record that changed since the last run via
+        OAI-PMH (new papers AND revised versions of older papers). The
+        position is stored in ``app_state`` so an interrupted run resumes.
+    2.  Known papers: update their metadata (title, abstract, categories, ...).
+    3.  Unknown papers (new, or older ones missing from the DB):
+        batch-request SemanticScholar for SPECTER v2 embeddings (768-D),
+        citations and references.
+    4.  For papers with embeddings:
+        -> PCA 768 -> 128-D
+        -> UMAP 128 -> 2-D
         -> save to ``paper`` + ``embedding``.
-    6.  Papers without SemanticScholar data 
-        -> ``uncaught_paper`` table.
-    7.  Periodically retry uncaught papers; after max retries they are kept
+    5.  Papers without SemanticScholar data -> ``uncaught_paper`` table.
+    6.  Periodically retry uncaught papers; after max retries they are kept
         ("parked") instead of deleted.
 
-    Steps 4–6 run batch by batch (default 100 papers), so a crash loses at
-    most one batch.
-        The pipeline is designed to run as a scheduled job (default: monthly)
-        via APScheduler inside ``main.py``.
+    Steps 3–5 run batch by batch (default 100 papers), so a crash loses at
+    most one batch. The pipeline runs as a scheduled job (default: monthly)
+    via APScheduler inside ``main.py``.
 """
 
 import os
 import time
-from datetime import datetime, timedelta
-
-import arxiv as arx
+from datetime import date, datetime, timedelta, timezone
 
 from config import cfg
 from util.logger import Logger
 from SemanticPaper.api.semantic_scholar import SemanticScholarAPI
-from SemanticPaper.api.arxiv import ArxivAPI
+from SemanticPaper.api.arxiv_oai import ArxivOAIClient, BadResumptionToken, OAIPage
 from SemanticPaper.pipeline.embedding_pipeline import EmbeddingPipeline
 from Database.db import (
     UNKNOWN_TITLE,
+    get_app_state,
+    set_app_state,
     get_newest_paper_date,
     get_known_entry_ids,
+    update_paper_metadata,
     save_processed_papers,
     save_uncaught_papers,
     get_uncaught_papers_due,
@@ -52,101 +51,85 @@ from Database.db import (
 
 logger = Logger("IncrementalPipeline")
 
+# app_state keys
+INCREMENTAL_STATE = "oai_incremental"
+BACKFILL_STATE = "oai_backfill"
+# arXiv's OAI repository starts here (Identify -> earliestDatestamp)
+ARXIV_EARLIEST_DATESTAMP = date(2005, 9, 16)
+
 
 # ------------------------------------------------------------------
-#  arXiv gap-fill fetcher
+#  OAI-PMH harvesting with resumable state
 # ------------------------------------------------------------------
 
 
-def _fetch_new_arxiv_papers(arxiv_client: ArxivAPI, since: datetime,
-                            max_results: int | None = None) -> list:
+def _today_utc() -> date:
+    return datetime.now(timezone.utc).date()
+
+
+def _max_retries() -> int:
+    return cfg.get_int("semanticpaper", "uncaught_max_retries", int(os.getenv("UNCAUGHT_MAX_RETRIES", "4")))
+
+
+def harvest(oai_client: ArxivOAIClient, state_prefix: str, from_date: date, on_page,
+            set_spec: str | None = None, persist: bool = True) -> dict:
     """
-    Abstract: Fetches papers from arXiv submitted after ``since``.
-        Returns a list of ``arxiv.Result`` objects (not our Paper dataclass)
-        so we keep all metadata available.
-    Args:
-    - arxiv_client: ArxivAPI instance
-    - since: datetime – fetch papers newer than this date
-    - max_results: optional cap
-    Returns: list[arxiv.Result]
+    Abstract: Harvests all OAI records from ``from_date`` up to today, page by
+        page, and calls ``on_page(page)`` for each. After every page the
+        resumption token is stored (``<state_prefix>_token``) together with
+        the target date (``<state_prefix>_until``), so a crashed or restarted
+        run continues where it stopped instead of starting over.
+    Returns: dict with ``pages``, ``records``, ``deleted``, ``until``
     """
-    # arXiv Suchdatum-Format: YYYYMMDDHHMMSS
-    date_str = since.strftime("%Y%m%d%H%M%S")
-    # Suche nach allen Papern, die nach dem übergebenen Datum eingereicht wurden
-    query = f"submittedDate:[{date_str} TO 99991231235959]"
+    token_key, until_key = f"{state_prefix}_token", f"{state_prefix}_until"
+    token = (get_app_state(token_key) or None) if persist else None
+    until = None
+    if token and persist:
+        stored_until = get_app_state(until_key)
+        until = date.fromisoformat(stored_until) if stored_until else None
+        logger.info(f"Resuming interrupted harvest (until {until})")
+    if until is None:
+        until = _today_utc()
+        token = None
+        if persist:
+            set_app_state(until_key, until.isoformat())
+    from_date = min(from_date, until)
 
-    logger.info(f"Querying arXiv for papers since {since.isoformat()} ...")
-
-    search = arx.Search(
-        query=query,
-        max_results=max_results,
-        sort_by=arx.SortCriterion.SubmittedDate,
-        sort_order=arx.SortOrder.Ascending,
-    )
-
-    results = []
+    stats = {"pages": 0, "records": 0, "deleted": 0, "until": until}
     try:
-        client = arxiv_client.client
-        for result in client.results(search):
-            results.append(result)
-            if max_results and len(results) >= max_results:
-                break
-    except Exception as e:
-        # Teilergebnis behalten: wird aufsteigend nach Datum geholt, der nächste
-        # Lauf setzt beim neuesten gespeicherten Paper wieder an.
-        logger.error(
-            f"Error fetching papers from arXiv after {len(results)} results: {e} – "
-            f"continuing with the partial result"
-        )
-
-    logger.info(f"Fetched {len(results)} papers from arXiv since {since.isoformat()}")
-    return results
-
-
-def _normalize_entry_id(entry_id_or_url: str) -> str:
-    """Strips the arxiv.org URL prefix and version suffix."""
-    # Entferne die URL-Präfixe, um nur die reine ID zu erhalten
-    eid = entry_id_or_url
-    for prefix in ("https://arxiv.org/abs/", "http://arxiv.org/abs/", "https://arxiv.org/", "http://arxiv.org/"):
-        eid = eid.replace(prefix, "")
-    # Entferne Versions-Suffix (z.B. v1, v2)
-    if "v" in eid.split("/")[-1]:
-        parts = eid.rsplit("v", 1)
-        if parts[-1].isdigit():
-            eid = parts[0]
-    return eid
+        for page in oai_client.iter_pages(from_date, until, set_spec, resumption_token=token):
+            on_page(page)
+            stats["pages"] += 1
+            stats["records"] += len(page.records)
+            stats["deleted"] += len(page.deleted_ids)
+            if persist:
+                set_app_state(token_key, page.resumption_token or "")
+            if stats["pages"] % 10 == 0:
+                logger.info(f"Harvest progress: {stats['pages']} pages, {stats['records']} records")
+    except BadResumptionToken:
+        if not token:
+            raise
+        # Token abgelaufen (gilt ca. 1 Tag): Lauf für denselben Zeitraum neu starten.
+        # Bereits verarbeitete Paper werden dabei als bekannt erkannt und übersprungen.
+        logger.warning("Stored resumption token expired – restarting harvest of the same date range")
+        set_app_state(token_key, "")
+        set_app_state(until_key, "")
+        return harvest(oai_client, state_prefix, from_date, on_page, set_spec, persist)
+    return stats
 
 
-
-def _categories_of(result) -> str | None:
-    """All categories of an arxiv.Result, primary category first, space-separated."""
-    if result is None:
-        return None
-    primary = getattr(result, "primary_category", None)
-    others = getattr(result, "categories", None)
-    cats: list[str] = []
-    if isinstance(primary, str) and primary:
-        cats.append(primary)
-    if isinstance(others, (list, tuple)):
-        cats.extend(c for c in others if isinstance(c, str) and c and c not in cats)
-    return " ".join(cats) if cats else None
+def _split_known(page: OAIPage) -> tuple[list[dict], list[dict]]:
+    """Splits a page into (unknown records, known records) with ONE DB query."""
+    known = get_known_entry_ids([r["entry_id"] for r in page.records])
+    new, existing = [], []
+    for r in page.records:
+        (existing if r["entry_id"] in known else new).append(r)
+    return new, existing
 
 
-def _metadata_from_result(result) -> dict:
-    """Paper metadata from an arxiv.Result (or placeholders if unknown)."""
-    if result is None:
-        return {"title": UNKNOWN_TITLE}
-    return {
-        "title": result.title,
-        "authors": ", ".join(str(a) for a in result.authors),
-        "abstract": result.summary,
-        "categories": _categories_of(result),
-        "published": result.published,
-        "updated": getattr(result, "updated", None),
-        "doi": getattr(result, "doi", None),
-        "journal_ref": getattr(result, "journal_ref", None),
-        "url": result.pdf_url,
-    }
+def _queue_as_uncaught(records: list[dict]):
+    max_retries = _max_retries()
+    save_uncaught_papers([{**r, "max_retries": max_retries} for r in records])
 
 
 def _metadata_from_uncaught(uncaught) -> dict:
@@ -227,75 +210,127 @@ def _process_in_batches(arxiv_ids: list[str], metadata: dict[str, dict],
 
 
 def run_incremental_update(
-    arxiv_client: ArxivAPI,
+    oai_client: ArxivOAIClient,
     s2_client: SemanticScholarAPI,
     pipeline: EmbeddingPipeline,
-    max_papers: int | None = None,
 ):
     """
-    Abstract: Executes one full incremental sync cycle.
+    Abstract: Executes one incremental sync cycle via OAI-PMH.
+        Harvests every record changed since the last successful run, updates
+        metadata of known papers and runs unknown papers through
+        SemanticScholar -> PCA/UMAP -> DB. The next run starts at the date
+        this run harvested up to (inclusive – overlap is deduplicated).
     Args:
-    - arxiv_client: ArxivAPI instance
+    - oai_client: ArxivOAIClient
     - s2_client: SemanticScholarAPI instance
     - pipeline: EmbeddingPipeline (PCA + UMAP)
-    - max_papers: optional cap on how many arXiv papers to fetch per cycle
     """
     logger.info("=== Incremental update started ===")
     t0 = time.time()
 
-    newest_date = get_newest_paper_date()
-    if newest_date is None:
-        # Wenn die Datenbank leer ist, brechen wir ab, da zuerst der initiale Import laufen muss
-        logger.warning("No papers in database – skipping incremental update (run initial import first).")
-        return
+    stored_from = get_app_state(f"{INCREMENTAL_STATE}_from")
+    if stored_from:
+        from_date = date.fromisoformat(stored_from)
+    else:
+        newest_date = get_newest_paper_date()
+        if newest_date is None:
+            # Wenn die Datenbank leer ist, brechen wir ab, da zuerst der initiale Import laufen muss
+            logger.warning("No papers in database – skipping incremental update (run initial import first).")
+            return
+        # Erster Lauf: kurz vor dem neuesten Paper beginnen (Überlappung wird dedupliziert)
+        from_date = newest_date.date() - timedelta(days=1)
 
-    logger.info(f"Newest paper in DB: {newest_date.isoformat()}")
+    logger.info(f"Harvesting arXiv changes since {from_date.isoformat()} ...")
     paper_count_before = get_paper_count()
+    totals = {"new": 0, "updated": 0, "saved": 0, "not_found": 0, "failed": 0}
 
-    # 1. Hole neue Paper von arXiv
-    raw_results = _fetch_new_arxiv_papers(arxiv_client, newest_date, max_results=max_papers)
-    if not raw_results:
-        logger.info("No new papers found on arXiv. Database is up to date.")
-        return
-
-    # 2. Duplikate entfernen: EINE Abfrage gegen paper + uncaught_paper statt
-    #    einer Abfrage pro Paper. Uncaught papers übernimmt der Retry-Job.
-    result_map: dict[str, arx.Result] = {}
-    for result in raw_results:
-        result_map.setdefault(_normalize_entry_id(result.entry_id), result)
-    known = get_known_entry_ids(list(result_map))
-    new_ids = [eid for eid in result_map if eid not in known]
-
-    logger.info(f"{len(new_ids)} genuinely new papers after dedup (out of {len(raw_results)} fetched)")
-    if not new_ids:
-        logger.info("All fetched papers already exist in the DB.")
-        return
-
-    metadata = {eid: _metadata_from_result(result_map[eid]) for eid in new_ids}
-    max_retries = cfg.get_int("semanticpaper", "uncaught_max_retries", int(os.getenv("UNCAUGHT_MAX_RETRIES", "4")))
-
-    def store_unprocessed(saved, not_found, failed):
+    def store_unprocessed(saved, not_found, failed, metadata):
         # Ohne S2-Daten (noch nicht bekannt oder Request fehlgeschlagen) ->
         # uncaught_paper; der Retry-Job versucht es später erneut.
         missing = list(not_found) + list(failed)
         if missing:
-            save_uncaught_papers([
-                {**metadata.get(eid, {}), "entry_id": eid, "max_retries": max_retries}
-                for eid in missing
-            ])
+            _queue_as_uncaught([{**metadata.get(eid, {}), "entry_id": eid} for eid in missing])
 
-    # 3.–5. S2 -> PCA/UMAP -> DB, Batch für Batch
-    totals = _process_in_batches(new_ids, metadata, s2_client, pipeline, on_batch_done=store_unprocessed)
+    def on_page(page: OAIPage):
+        new, existing = _split_known(page)
+        if existing:
+            update_paper_metadata(existing)
+            totals["updated"] += len(existing)
+        if not new:
+            return
+        totals["new"] += len(new)
+        metadata = {r["entry_id"]: r for r in new}
+        result = _process_in_batches(
+            list(metadata), metadata, s2_client, pipeline,
+            on_batch_done=lambda s, nf, f: store_unprocessed(s, nf, f, metadata),
+        )
+        totals["saved"] += len(result["saved"])
+        totals["not_found"] += len(result["not_found"])
+        totals["failed"] += len(result["failed"])
+
+    stats = harvest(oai_client, INCREMENTAL_STATE, from_date, on_page)
+    # Erst nach vollständigem Durchlauf weiterrücken
+    set_app_state(f"{INCREMENTAL_STATE}_from", stats["until"].isoformat())
+    set_app_state(f"{INCREMENTAL_STATE}_token", "")
+    set_app_state(f"{INCREMENTAL_STATE}_until", "")
 
     elapsed = time.time() - t0
-    paper_count_after = get_paper_count()
     logger.info(
         f"=== Incremental update complete in {elapsed:.1f}s === "
-        f"Processed: {len(totals['saved'])}, "
-        f"Uncaught: {len(totals['not_found']) + len(totals['failed'])} "
-        f"(of which request failures: {len(totals['failed'])}), "
-        f"DB total: {paper_count_before} -> {paper_count_after}"
+        f"Harvested: {stats['records']} records ({stats['pages']} pages, {stats['deleted']} withdrawn), "
+        f"already known: {totals['updated']} (metadata refreshed), new: {totals['new']} "
+        f"(saved {totals['saved']}, uncaught {totals['not_found'] + totals['failed']}, "
+        f"of which request failures {totals['failed']}), "
+        f"DB total: {paper_count_before} -> {get_paper_count()}"
     )
+    return totals
+
+
+def backfill_missing_papers(
+    oai_client: ArxivOAIClient,
+    from_date: date = ARXIV_EARLIEST_DATESTAMP,
+    set_spec: str | None = None,
+    dry_run: bool = False,
+    update_metadata: bool = False,
+) -> dict:
+    """
+    Abstract: One-off completeness check against all of arXiv.
+        Harvests every OAI record (optionally only one set, e.g. "cs" or
+        "physics:hep-ph") and queues papers missing from the DB into
+        uncaught_paper. The regular retry job then fetches their embeddings
+        from SemanticScholar in batches. Resumable like the incremental run.
+    Args:
+    - from_date: start datestamp (default: beginning of arXiv's OAI repository)
+    - set_spec: optional OAI set to limit the harvest
+    - dry_run: only count, write nothing (state is not persisted either)
+    - update_metadata: also refresh metadata of papers already in the DB
+    Returns: dict with ``records``, ``missing``, ``queued``, ``updated``
+    """
+    totals = {"records": 0, "missing": 0, "queued": 0, "updated": 0}
+
+    def on_page(page: OAIPage):
+        new, existing = _split_known(page)
+        totals["records"] += len(page.records)
+        totals["missing"] += len(new)
+        if dry_run:
+            return
+        if new:
+            _queue_as_uncaught(new)
+            totals["queued"] += len(new)
+        if update_metadata and existing:
+            totals["updated"] += update_paper_metadata(existing)
+
+    logger.info(f"=== Backfill started (from {from_date}, set={set_spec or 'all'}, dry_run={dry_run}) ===")
+    stats = harvest(oai_client, BACKFILL_STATE, from_date, on_page, set_spec=set_spec, persist=not dry_run)
+    if not dry_run:
+        set_app_state(f"{BACKFILL_STATE}_token", "")
+        set_app_state(f"{BACKFILL_STATE}_until", "")
+    logger.info(
+        f"=== Backfill complete: {totals['records']} arXiv records, {totals['missing']} missing in DB, "
+        f"{totals['queued']} queued for SemanticScholar, {totals['updated']} metadata updates, "
+        f"{stats['deleted']} withdrawn ==="
+    )
+    return totals
 
 
 def retry_uncaught_papers(
