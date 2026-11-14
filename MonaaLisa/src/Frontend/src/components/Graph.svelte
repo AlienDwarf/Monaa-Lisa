@@ -9,10 +9,16 @@
     import { env as publicEnv } from "$env/dynamic/public";
     import GraphLib from "graphology";
     import Sigma from "sigma";
-    import type { Paper } from "$lib/types/paper";
-    import { json } from "d3";
+    import type { CategoryPoints, Paper } from "$lib/types/paper";
+    import {
+        fetchAuthorPaperIds,
+        fetchPaperDetails,
+        mergeDetails,
+        pointToPaper,
+    } from "../utils/paperApi";
 
-    export let papers: Paper[] = [];
+    /** Spaltenorientierte Punktwolke der Kategorie (aus GET /papers/points). */
+    export let points: CategoryPoints;
     export let selectedPaperId: string | null = null;
     export let categoryColor: string = "#4a9eff";
     /** Author name to highlight in the graph. Empty string = no highlight. */
@@ -25,10 +31,18 @@
     // Return value of searched papers
     export let searchHighlightPapers: Paper[] = [];
 
+    /** Backend verlangt für Text-/Autorensuche mindestens 3 Zeichen. */
+    const MIN_QUERY_LEN = 3;
+
     let container: HTMLDivElement | null = null;
     let renderer: Sigma | null = null;
     let graph: GraphLib | null = null;
+    /**
+     * Nur Paper mit geladenen Details (Hover/Klick) und per Highlight
+     * eingefügte Paper. Reine Punkte leben nur in `points` + Graph-Attributen.
+     */
     let paperCache = new Map<string, Paper>();
+    const MAX_PAPER_CACHE = 5000;
     // Hover waits before closing
     let hoverTimeout: number | null = null;
     let hoveredPaper: Paper | null = null;
@@ -42,12 +56,36 @@
     /** Stored globally so added nodes can be sized consistently with existing ones. */
     let maxCit = 0;
 
+    // ─── Highlight-Zustand (wird im nodeReducer angewendet) ───────────
+    // Statt bei jedem Highlight alle Knoten per setNodeAttribute umzufärben
+    // (O(n) Graph-Events), halten wir den Zustand in Sets/Maps und lassen
+    // Sigma ihn beim Rendern über den nodeReducer anwenden.
+    const DIM_COLOR = "rgba(255,255,255,0.08)";
+    /** Search/Author-Highlight aktiv → nicht enthaltene Knoten werden gedimmt */
+    let hlActive = false;
+    /** Hervorgehobene Knoten → Mindestgröße */
+    let hlNodes = new Map<string, number>();
+    let hlColor = "";
+    /** Ausgewählter Knoten (selectedPaperId) und seine Zitationen */
+    let selCenter: string | null = null;
+    let selCited = new Set<string>();
+
     const dispatch = createEventDispatcher();
+
+    function cachePaper(p: Paper) {
+        paperCache.delete(p.entry_id);
+        paperCache.set(p.entry_id, p);
+        while (paperCache.size > MAX_PAPER_CACHE) {
+            const oldest = paperCache.keys().next().value as string;
+            paperCache.delete(oldest);
+        }
+    }
 
     // ─── total citation count for node sizing ─────────────────────────
     function totalCitations(p: Paper): number {
-        // Wir nutzen die numerischen Felder, die das Backend IMMER mitschickt,
-        const arxivCit = p.citations?.length ?? 0;
+        // Punkte aus /papers/points bringen die arXiv-Zitationszahl direkt mit,
+        // volle Paper eine citations-Liste.
+        const arxivCit = p.arxiv_citation_count ?? p.citations?.length ?? 0;
         const nonArxivCit = p.non_arxiv_citation_count ?? 0;
 
         return Math.max(
@@ -74,7 +112,7 @@
     // │                  better separation but slower load.
     // │  REPEL_STRENGTH– [0-1] fraction of overlap moved per iteration.
     // └────────────────────────────────────────────────────────────────
-    const n = papers.length;
+    const n = points?.count ?? 0;
     const MIN_DIST = 2.5 * Math.sqrt(Math.max(1, n) / 1000); // minimum distance between any two nodes
     const SPREAD_ITERS = 10; //60;
     const REPEL_STRENGTH = 0.5;
@@ -84,378 +122,117 @@
     const ANCHOR = 0.012 * Math.sqrt(Math.max(1, n) / 1000); // 0.12..0.25 (mehr = UMAP-treuer)
     const MAX_DRIFT = 180;
 
-    function applySpread(g: GraphLib) {
-        const nodes = g.nodes();
-        if (nodes.length < 2) return;
+    // Spread nur bis zu dieser Knotenzahl. Darüber zeigen wir die UMAP-
+    // Koordinaten unverändert – Überlappung löst sich beim Reinzoomen auf.
+    const SPREAD_MAX_NODES = 10000;
+
+    // Gleicher Algorithmus wie zuvor (paarweise Abstoßung + Anker zur
+    // UMAP-Position), aber statt jedes Paar zu prüfen (O(n²)) kommen die Knoten
+    // in ein Raster mit Zellgröße = größter möglicher Mindestabstand. Zwei
+    // Knoten können sich nur überlappen, wenn sie in derselben oder einer
+    // benachbarten Zelle liegen → pro Knoten nur 9 Zellen prüfen, ~O(n).
+    // Gerechnet wird direkt auf den Typed Arrays, bevor die Knoten in den
+    // Graph kommen (keine Attribut-Lese-/Schreibzugriffe).
+    function applySpread(
+        xs: Float64Array,
+        ys: Float64Array,
+        sizes: Float64Array,
+    ) {
+        const N = xs.length;
+        if (N < 2 || N > SPREAD_MAX_NODES) return;
+
+        const x0s = Float64Array.from(xs);
+        const y0s = Float64Array.from(ys);
+        let maxSize = 0;
+        for (let i = 0; i < N; i++) if (sizes[i] > maxSize) maxSize = sizes[i];
+
+        const cellSize = 2 * maxSize + MIN_DIST;
+        const cellX = new Int32Array(N);
+        const cellY = new Int32Array(N);
+        const next = new Int32Array(N); // verkettete Liste pro Zelle
+        // Halbe Nachbarschaft: jedes Zellpaar wird genau einmal besucht.
+        const NEIGHBOURS: [number, number][] = [
+            [1, 0],
+            [-1, 1],
+            [0, 1],
+            [1, 1],
+        ];
+
+        const pushApart = (i: number, j: number) => {
+            const dx = xs[j] - xs[i];
+            const dy = ys[j] - ys[i];
+            const dist = Math.sqrt(dx * dx + dy * dy) || 0.0001;
+            // "nicht berühren": Abstand ~ Summe Radien + kleiner Gap
+            const minDist = sizes[i] + sizes[j] + MIN_DIST;
+            if (dist < minDist) {
+                const push = ((minDist - dist) / 2) * REPEL_STRENGTH;
+                const ux = (dx / dist) * push;
+                const uy = (dy / dist) * push;
+                xs[i] -= ux;
+                ys[i] -= uy;
+                xs[j] += ux;
+                ys[j] += uy;
+            }
+        };
 
         for (let iter = 0; iter < SPREAD_ITERS; iter++) {
-            for (let i = 0; i < nodes.length; i++) {
-                let xi = g.getNodeAttribute(nodes[i], "x");
-                let yi = g.getNodeAttribute(nodes[i], "y");
-                const sizeI = g.getNodeAttribute(nodes[i], "size") || 2;
+            // Raster neu aufbauen (Knoten haben sich bewegt)
+            let minX = Infinity;
+            let minY = Infinity;
+            let maxX = -Infinity;
+            for (let i = 0; i < N; i++) {
+                if (xs[i] < minX) minX = xs[i];
+                if (ys[i] < minY) minY = ys[i];
+                if (xs[i] > maxX) maxX = xs[i];
+            }
+            const cols = Math.floor((maxX - minX) / cellSize) + 1;
+            const head = new Map<number, number>();
+            for (let i = 0; i < N; i++) {
+                const cx = Math.floor((xs[i] - minX) / cellSize);
+                const cy = Math.floor((ys[i] - minY) / cellSize);
+                cellX[i] = cx;
+                cellY[i] = cy;
+                const key = cy * cols + cx;
+                next[i] = head.get(key) ?? -1;
+                head.set(key, i);
+            }
 
-                for (let j = i + 1; j < nodes.length; j++) {
-                    let xj = g.getNodeAttribute(nodes[j], "x");
-                    let yj = g.getNodeAttribute(nodes[j], "y");
-                    const sizeJ = g.getNodeAttribute(nodes[j], "size") || 2;
-
-                    const dx = xj - xi;
-                    const dy = yj - yi;
-                    const dist = Math.sqrt(dx * dx + dy * dy) || 0.0001;
-
-                    // "nicht berühren": Abstand ~ Summe Radien + kleiner Gap
-                    const minDist = sizeI + sizeJ + MIN_DIST;
-
-                    if (dist < minDist) {
-                        const push = ((minDist - dist) / 2) * REPEL_STRENGTH;
-                        const ux = (dx / dist) * push;
-                        const uy = (dy / dist) * push;
-
-                        xi -= ux;
-                        yi -= uy;
-                        xj += ux;
-                        yj += uy;
-
-                        g.setNodeAttribute(nodes[i], "x", xi);
-                        g.setNodeAttribute(nodes[i], "y", yi);
-                        g.setNodeAttribute(nodes[j], "x", xj);
-                        g.setNodeAttribute(nodes[j], "y", yj);
+            for (let i = 0; i < N; i++) {
+                const cx = cellX[i];
+                const cy = cellY[i];
+                // gleiche Zelle: jedes Paar einmal (j > i)
+                for (let j = head.get(cy * cols + cx) ?? -1; j !== -1; j = next[j]) {
+                    if (j > i) pushApart(i, j);
+                }
+                // vier "vorwärts" liegende Nachbarzellen
+                for (const [ox, oy] of NEIGHBOURS) {
+                    const nx = cx + ox;
+                    if (nx < 0 || nx >= cols) continue;
+                    const key = (cy + oy) * cols + nx;
+                    for (let j = head.get(key) ?? -1; j !== -1; j = next[j]) {
+                        pushApart(i, j);
                     }
                 }
             }
 
-            // Anchor zurück Richtung Originalposition + Drift clamp
-            nodes.forEach((n) => {
-                const x0 = g.getNodeAttribute(n, "x0");
-                const y0 = g.getNodeAttribute(n, "y0");
-                let x = g.getNodeAttribute(n, "x");
-                let y = g.getNodeAttribute(n, "y");
-
-                x += (x0 - x) * ANCHOR;
-                y += (y0 - y) * ANCHOR;
-
-                const ddx = x - x0;
-                const ddy = y - y0;
+            // Anker zurück Richtung Originalposition + Drift clamp
+            for (let i = 0; i < N; i++) {
+                let x = xs[i] + (x0s[i] - xs[i]) * ANCHOR;
+                let y = ys[i] + (y0s[i] - ys[i]) * ANCHOR;
+                const ddx = x - x0s[i];
+                const ddy = y - y0s[i];
                 const d = Math.sqrt(ddx * ddx + ddy * ddy);
                 if (d > MAX_DRIFT) {
-                    x = x0 + (ddx / d) * MAX_DRIFT;
-                    y = y0 + (ddy / d) * MAX_DRIFT;
+                    x = x0s[i] + (ddx / d) * MAX_DRIFT;
+                    y = y0s[i] + (ddy / d) * MAX_DRIFT;
                 }
-
-                g.setNodeAttribute(n, "x", x);
-                g.setNodeAttribute(n, "y", y);
-            });
+                xs[i] = x;
+                ys[i] = y;
+            }
         }
     }
 
     $: applyGraphHighlights(searchHighlightPapers, authorHighlight);
-
-    $: if (selectedPaperId && graph && renderer) {
-        // Wir prüfen, ob sich die ID wirklich geändert hat,
-        // um unnötige Server-Anfragen zu vermeiden
-        if (selectedPaperId !== selectedNode) {
-            highlightNode(selectedPaperId);
-        }
-    }
-
-    function applyGraphHighlights(searchPapers: Paper[], authorQ: string) {
-        if (!graph || !renderer) return;
-        if (searchPapers.length === 0 && !authorQ) {
-            restoreAllNodeColors();
-            // Falls trotzdem ein Paper ausgewählt ist, zeichnen wir dessen Highlights neu
-            if (selectedPaperId) highlightNode(selectedPaperId);
-            return;
-        }
-        if (searchPapers.length > 0) {
-            applySearchHighlight(searchPapers);
-        } else if (authorQ) {
-            handleAuthorHighlight(authorQ);
-        } else {
-            restoreAllNodeColors();
-        }
-    }
-
-    /** Restore all nodes to their original colours and remove any injected nodes. */
-    function restoreAllNodeColors() {
-        if (!graph || !renderer) return;
-        // Remove author-added nodes
-        for (const nid of authorAddedNodes) {
-            if (graph.hasNode(nid)) {
-                graph.edges(nid).forEach((e) => graph!.dropEdge(e));
-                graph.dropNode(nid);
-            }
-        }
-        authorAddedNodes = new Set();
-        // Remove search-added nodes
-        for (const nid of searchAddedNodes) {
-            if (graph.hasNode(nid)) {
-                graph.edges(nid).forEach((e) => graph!.dropEdge(e));
-                graph.dropNode(nid);
-            }
-        }
-        searchAddedNodes = new Set();
-        // Restore original colours
-        graph.forEachNode((n) => {
-            graph!.setNodeAttribute(
-                n,
-                "color",
-                graph!.getNodeAttribute(n, "originalColor"),
-            );
-        });
-        renderer.refresh();
-    }
-
-    /**
-     * Highlight search results in the graph.
-     * - Nodes matching a result entry_id get the category colour at full opacity.
-     * - Non-matching nodes are dimmed.
-     * - Papers missing from the graph are injected (up to MAX_SEARCH_ADD),
-     *   sized using the same citation-count formula as regular nodes.
-     */
-    function applySearchHighlight(papers: Paper[]) {
-        if (!graph || !renderer) return;
-
-        // Remove previously injected search nodes before re-applying.
-        for (const nid of searchAddedNodes) {
-            if (graph.hasNode(nid)) {
-                graph.edges(nid).forEach((e) => graph!.dropEdge(e));
-                graph.dropNode(nid);
-            }
-        }
-        searchAddedNodes = new Set();
-        // Also remove author-added nodes since search takes priority.
-        for (const nid of authorAddedNodes) {
-            if (graph.hasNode(nid)) {
-                graph.edges(nid).forEach((e) => graph!.dropEdge(e));
-                graph.dropNode(nid);
-            }
-        }
-        authorAddedNodes = new Set();
-
-        const entryIds = new Set(papers.map((p) => p.entry_id));
-        const rgb = hexToRgb(categoryColor);
-        // Full-opacity category colour for highlighted (found) nodes.
-        const highlightColor = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},1.0)`;
-
-        // First pass: colour existing nodes.
-        graph.forEachNode((n) => {
-            if (entryIds.has(n)) {
-                graph!.setNodeAttribute(n, "color", highlightColor);
-                graph!.setNodeAttribute(n, "size", 4);
-            } else {
-                graph!.setNodeAttribute(n, "color", "rgba(255,255,255,0.08)");
-            }
-        });
-
-        // Second pass: inject missing papers (capped at MAX_SEARCH_ADD).
-        let addedCount = 0;
-        for (let i = 0; i < papers.length && addedCount < MAX_SEARCH_ADD; i++) {
-            const p = papers[i];
-            if (graph.hasNode(p.entry_id)) continue; // already shown
-
-            // Size follows the same formula as regular nodes so proportions match.
-            const cit = totalCitations(p);
-            const size = 3; //2 + (maxCit > 0 ? (cit / maxCit) * 6 : 2);
-
-            // Prefer UMAP position; fall back to outward spiral around the graph.
-            const hasUmap = p.tsne1 !== 0 || p.tsne2 !== 0;
-            console.log(
-                "applying search highlight for",
-                p.entry_id,
-                "has UMAP?",
-                hasUmap,
-            );
-            const spiralAngle =
-                (papers.length + i) * Math.PI * (3 - Math.sqrt(5));
-            const x = hasUmap
-                ? p.tsne1 * COORD_SCALE
-                : 6 * Math.sqrt(papers.length + i + 1) * Math.cos(spiralAngle);
-            const y = hasUmap
-                ? p.tsne2 * COORD_SCALE
-                : 6 * Math.sqrt(papers.length + i + 1) * Math.sin(spiralAngle);
-
-            graph.addNode(p.entry_id, {
-                x,
-                y,
-                x0: x,
-                y0: y,
-                size,
-                label: p.title,
-                color: highlightColor,
-                originalColor: highlightColor,
-                zIndex: Math.ceil(size),
-            });
-            paperCache.set(p.entry_id, p);
-            searchAddedNodes.add(p.entry_id);
-            addedCount++;
-        }
-        console.log("search addedCount", addedCount);
-
-        renderer.refresh();
-    }
-
-    // Highlight existing graph nodes whose authors contain the search term;
-    // then ALWAYS fetch from the API and add any matching papers not yet in the graph.
-    async function handleAuthorHighlight(author: string) {
-        if (!graph || !renderer) return;
-
-        // Remove any nodes we previously added for author-highlight purposes
-        for (const nid of authorAddedNodes) {
-            if (graph.hasNode(nid)) {
-                graph.edges(nid).forEach((e) => graph!.dropEdge(e));
-                graph.dropNode(nid);
-            }
-        }
-        authorAddedNodes = new Set();
-
-        if (!author) {
-            // Empty author string = clear all highlights, restore original colors
-            graph.forEachNode((n) => {
-                graph!.setNodeAttribute(
-                    n,
-                    "color",
-                    graph!.getNodeAttribute(n, "originalColor"),
-                );
-            });
-            renderer.refresh();
-            return;
-        }
-
-        const q = author.toLowerCase();
-        // Resolve category colour to full-opacity rgba for highlighted nodes.
-        const rgb = hexToRgb(categoryColor);
-        const matchColor = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},1.0)`;
-
-        // First pass: highlight existing nodes or dim them
-        graph.forEachNode((n) => {
-            const p = paperCache.get(n);
-            if (p && p.authors.toLowerCase().includes(q)) {
-                // Category colour (full opacity) for matching nodes
-                graph!.setNodeAttribute(n, "color", matchColor);
-                graph!.setNodeAttribute(
-                    n,
-                    "size",
-                    Math.max(graph!.getNodeAttribute(n, "size"), 3),
-                );
-            } else {
-                // Dim non-matching nodes
-                graph!.setNodeAttribute(n, "color", "rgba(255,255,255,0.08)");
-            }
-        });
-
-        // Always fetch from the API to find ALL matching papers
-        if (categoryId) {
-            try {
-                const params = new URLSearchParams();
-                params.set("search", author);
-                params.set("categories", categoryId);
-                params.set("take", "50"); // fetch up to 50 matching papers
-                params.set("skip", "0");
-                // call api endpoint (The service is PAPERS.SERVICE.TS in the backend)
-                const res = await fetch(
-                    `${apiBaseUrl}/papers?${params.toString()}`,
-                );
-                if (res.ok) {
-                    const payload = await res.json();
-                    const items: any[] = Array.isArray(payload)
-                        ? payload
-                        : (payload?.items ?? []);
-                    // Only keep papers whose author field actually matches the search term
-                    const matching = items.filter((raw: any) => {
-                        const authors = Array.isArray(raw.authors)
-                            ? raw.authors.join(", ")
-                            : (raw.authors ?? "");
-                        return authors.toLowerCase().includes(q);
-                    });
-                    matching.forEach((raw: any, i: number) => {
-                        if (graph!.hasNode(raw.entry_id)) {
-                            // Already in the graph - make sure it's highlighted
-                            graph!.setNodeAttribute(
-                                raw.entry_id,
-                                "color",
-                                matchColor,
-                            );
-                            graph!.setNodeAttribute(raw.entry_id, "size", 8);
-                        } else {
-                            // Not in the graph yet - add it at a computed position
-                            const hasUmap = raw.tsne1 || raw.tsne?.x;
-                            const rawTsneX = hasUmap
-                                ? (raw.tsne?.x ?? raw.tsne1 ?? 0)
-                                : 6 *
-                                  Math.sqrt(papers.length + i + 1) *
-                                  Math.cos(
-                                      (papers.length + i) *
-                                          Math.PI *
-                                          (3 - Math.sqrt(5)),
-                                  );
-                            const rawTsneY = hasUmap
-                                ? (raw.tsne?.y ?? raw.tsne2 ?? 0)
-                                : 6 *
-                                  Math.sqrt(papers.length + i + 1) *
-                                  Math.sin(
-                                      (papers.length + i) *
-                                          Math.PI *
-                                          (3 - Math.sqrt(5)),
-                                  );
-
-                            const x = rawTsneX * COORD_SCALE;
-                            const y = rawTsneY * COORD_SCALE;
-
-                            const authors = Array.isArray(raw.authors)
-                                ? raw.authors.join(", ")
-                                : (raw.authors ?? "");
-                            const newPaper: Paper = {
-                                id: Number(raw.id ?? 0),
-                                entry_id: raw.entry_id,
-                                title: raw.title ?? raw.entry_id,
-                                authors,
-                                abstract: raw.abstract ?? "",
-                                published: raw.published ?? null,
-                                categories: raw.categories ?? null,
-                                url: raw.url ?? null,
-                                citations: Array.isArray(raw.citations)
-                                    ? raw.citations
-                                    : [],
-                                references: [],
-                                non_arxiv_citation_count: Number(
-                                    raw.non_arxiv_citation_count ?? 0,
-                                ),
-                                non_arxiv_reference_count: Number(
-                                    raw.non_arxiv_reference_count ?? 0,
-                                ),
-                                tsne1: rawTsneX,
-                                tsne2: rawTsneY,
-                                cluster: raw.categories ?? "U",
-                            };
-                            graph!.addNode(raw.entry_id, {
-                                x,
-                                y,
-                                x0: x,
-                                y0: y,
-                                // Size proportional to citations, same formula as regular nodes.
-                                size:
-                                    2 +
-                                    (maxCit > 0
-                                        ? (totalCitations(newPaper) / maxCit) *
-                                          6
-                                        : 2),
-                                label: raw.title ?? raw.entry_id,
-                                color: matchColor,
-                                originalColor: matchColor,
-                                zIndex: 10,
-                            });
-                            paperCache.set(raw.entry_id, newPaper);
-                            authorAddedNodes.add(raw.entry_id);
-                        }
-                    });
-                    console.log("author added", authorAddedNodes.size);
-                }
-            } catch {
-                /* ignore network errors silently */
-            }
-        }
-        renderer.refresh();
-    }
 
     // ─── reactively select node when prop changes ─────────────────────
     $: if (
@@ -467,113 +244,385 @@
         highlightNode(selectedPaperId);
     }
 
+    function applyGraphHighlights(searchPapers: Paper[], authorQ: string) {
+        if (!graph || !renderer) return;
+        if (searchPapers.length === 0 && !authorQ) {
+            restoreAllNodeColors();
+            return;
+        }
+        if (searchPapers.length > 0) {
+            applySearchHighlight(searchPapers);
+        } else if (authorQ) {
+            handleAuthorHighlight(authorQ);
+        } else {
+            restoreAllNodeColors();
+        }
+    }
+
+    function dropInjected(set: Set<string>) {
+        if (!graph) return;
+        for (const nid of set) {
+            if (graph.hasNode(nid)) graph.dropNode(nid); // entfernt auch Kanten
+        }
+    }
+
+    /** Remove search/author highlight state and any injected nodes. */
+    function restoreAllNodeColors() {
+        if (!graph || !renderer) return;
+        authorHighlightToken++; // laufende Autor-Abfragen verwerfen
+        dropInjected(authorAddedNodes);
+        authorAddedNodes = new Set();
+        dropInjected(searchAddedNodes);
+        searchAddedNodes = new Set();
+        hlActive = false;
+        hlNodes = new Map();
+        renderer.refresh();
+    }
+
+    function fullColor(): string {
+        const rgb = hexToRgb(categoryColor);
+        return `rgba(${rgb[0]},${rgb[1]},${rgb[2]},1.0)`;
+    }
+
+    /**
+     * Highlight search results in the graph.
+     * - Nodes matching a result entry_id get the category colour at full opacity.
+     * - Non-matching nodes are dimmed.
+     * - Papers missing from the graph are injected (up to MAX_SEARCH_ADD),
+     *   sized using the same citation-count formula as regular nodes.
+     */
+    function applySearchHighlight(papers: Paper[]) {
+        if (!graph || !renderer) return;
+        authorHighlightToken++; // Suche hat Vorrang vor laufenden Autor-Abfragen
+
+        // Remove previously injected search + author nodes before re-applying.
+        dropInjected(searchAddedNodes);
+        searchAddedNodes = new Set();
+        dropInjected(authorAddedNodes);
+        authorAddedNodes = new Set();
+
+        const highlightColor = fullColor();
+        hlColor = highlightColor;
+        hlNodes = new Map();
+        for (const p of papers) hlNodes.set(p.entry_id, 4);
+        hlActive = true;
+
+        // Inject missing papers (capped at MAX_SEARCH_ADD).
+        let addedCount = 0;
+        for (let i = 0; i < papers.length && addedCount < MAX_SEARCH_ADD; i++) {
+            const p = papers[i];
+            if (graph.hasNode(p.entry_id)) continue; // already shown
+
+            const size = 3; //2 + (maxCit > 0 ? (cit / maxCit) * 6 : 2);
+
+            // Prefer UMAP position; fall back to outward spiral around the graph.
+            const hasUmap = p.tsne1 !== 0 || p.tsne2 !== 0;
+            const spiralAngle = (n + i) * Math.PI * (3 - Math.sqrt(5));
+            const x = hasUmap
+                ? p.tsne1 * COORD_SCALE
+                : 6 * Math.sqrt(n + i + 1) * Math.cos(spiralAngle);
+            const y = hasUmap
+                ? p.tsne2 * COORD_SCALE
+                : 6 * Math.sqrt(n + i + 1) * Math.sin(spiralAngle);
+
+            graph.addNode(p.entry_id, {
+                x,
+                y,
+                size,
+                label: p.title,
+                color: highlightColor,
+                zIndex: Math.ceil(size),
+            });
+            cachePaper(p);
+            searchAddedNodes.add(p.entry_id);
+            addedCount++;
+        }
+
+        renderer.refresh();
+    }
+
+    // Highlight existing graph nodes whose authors contain the search term;
+    // then fetch from the API and add any matching papers not yet in the graph.
+    let authorHighlightToken = 0;
+
+    async function handleAuthorHighlight(author: string) {
+        if (!graph || !renderer) return;
+
+        // Remove any nodes we previously added for author-highlight purposes
+        dropInjected(authorAddedNodes);
+        authorAddedNodes = new Set();
+
+        if (!author) {
+            authorHighlightToken++; // laufende Abfragen verwerfen
+            hlActive = false;
+            hlNodes = new Map();
+            renderer.refresh();
+            return;
+        }
+
+        const q = author.toLowerCase();
+        const matchColor = fullColor();
+        hlColor = matchColor;
+
+        // First pass: nur Paper mit bekannten Autoren (Details geladen) –
+        // statt über alle Knoten zu iterieren.
+        const matches = new Map<string, number>();
+        for (const [id, p] of paperCache) {
+            if (p.authors && p.authors.toLowerCase().includes(q) && graph.hasNode(id))
+                matches.set(id, 3);
+        }
+        hlNodes = matches;
+        hlActive = true;
+        renderer.refresh();
+
+        // Neuere Eingaben machen ältere, noch laufende Abfragen ungültig
+        const token = ++authorHighlightToken;
+        const isStale = () =>
+            token !== authorHighlightToken || !graph || !renderer;
+
+        // Backend verlangt mindestens 3 Zeichen → kürzere Eingaben nur lokal
+        if (!categoryId || author.trim().length < MIN_QUERY_LEN) return;
+
+        // Punkte aus /papers/points kennen ihre Autoren nicht (erst nach
+        // Hover/Klick). Deshalb IDs ALLER Treffer der Kategorie vom Backend
+        // holen und die vorhandenen Knoten damit hervorheben.
+        const ids = await fetchAuthorPaperIds(apiBaseUrl, categoryId, author);
+        if (isStale()) return;
+        for (const id of ids) {
+            if (graph!.hasNode(id) && !matches.has(id)) matches.set(id, 3);
+        }
+        renderer!.refresh();
+
+        // Treffer, die (wegen Paper-Limit) nicht im Graph sind, mit ihren
+        // Koordinaten nachladen und ergänzen (max. 50)
+        try {
+            const params = new URLSearchParams();
+            params.set("search", author);
+            params.set("categories", categoryId);
+            params.set("take", "50"); // fetch up to 50 matching papers
+            params.set("skip", "0");
+            // call api endpoint (The service is PAPERS.SERVICE.TS in the backend)
+            const res = await fetch(`${apiBaseUrl}/papers?${params.toString()}`);
+            if (isStale()) return;
+            if (res.ok) {
+                const payload = await res.json();
+                if (isStale()) return;
+                const items: any[] = Array.isArray(payload)
+                    ? payload
+                    : (payload?.items ?? []);
+                // Only keep papers whose author field actually matches the search term
+                const matching = items.filter((raw: any) => {
+                    const authors = Array.isArray(raw.authors)
+                        ? raw.authors.join(", ")
+                        : (raw.authors ?? "");
+                    return authors.toLowerCase().includes(q);
+                });
+                matching.forEach((raw: any, i: number) => {
+                    if (graph!.hasNode(raw.entry_id)) {
+                        // Already in the graph - make sure it's highlighted
+                        matches.set(raw.entry_id, 8);
+                        return;
+                    }
+                    // Not in the graph yet - add it at a computed position
+                    const hasUmap = raw.tsne1 || raw.tsne?.x;
+                    const angle = (n + i) * Math.PI * (3 - Math.sqrt(5));
+                    const rawTsneX = hasUmap
+                        ? (raw.tsne?.x ?? raw.tsne1 ?? 0)
+                        : 6 * Math.sqrt(n + i + 1) * Math.cos(angle);
+                    const rawTsneY = hasUmap
+                        ? (raw.tsne?.y ?? raw.tsne2 ?? 0)
+                        : 6 * Math.sqrt(n + i + 1) * Math.sin(angle);
+
+                    const x = rawTsneX * COORD_SCALE;
+                    const y = rawTsneY * COORD_SCALE;
+
+                    const authors = Array.isArray(raw.authors)
+                        ? raw.authors.join(", ")
+                        : (raw.authors ?? "");
+                    const newPaper: Paper = {
+                        id: Number(raw.id ?? 0),
+                        entry_id: raw.entry_id,
+                        title: raw.title ?? raw.entry_id,
+                        authors,
+                        abstract: raw.abstract ?? "",
+                        published: raw.published ?? null,
+                        categories: raw.categories ?? null,
+                        url: raw.url ?? null,
+                        citations: Array.isArray(raw.citations)
+                            ? raw.citations
+                            : [],
+                        references: [],
+                        non_arxiv_citation_count: Number(
+                            raw.non_arxiv_citation_count ?? 0,
+                        ),
+                        non_arxiv_reference_count: Number(
+                            raw.non_arxiv_reference_count ?? 0,
+                        ),
+                        tsne1: rawTsneX,
+                        tsne2: rawTsneY,
+                        cluster: raw.categories ?? "U",
+                    };
+                    const size =
+                        2 +
+                        (maxCit > 0
+                            ? (totalCitations(newPaper) / maxCit) * 6
+                            : 2);
+                    graph!.addNode(raw.entry_id, {
+                        x,
+                        y,
+                        // Size proportional to citations, same formula as regular nodes.
+                        size,
+                        label: raw.title ?? raw.entry_id,
+                        color: matchColor,
+                        zIndex: 10,
+                    });
+                    cachePaper(newPaper);
+                    authorAddedNodes.add(raw.entry_id);
+                    matches.set(raw.entry_id, size);
+                });
+            }
+        } catch {
+            /* ignore network errors silently */
+        }
+        if (!isStale()) renderer!.refresh();
+    }
+
     async function highlightNode(nodeId: string) {
         if (!graph || !renderer || !graph.hasNode(nodeId)) return;
+        selectedNode = nodeId;
 
-        // 1. Alle anderen Knoten dimmen und alte Kanten löschen
-        graph.forEachNode((n) => {
-            graph!.setNodeAttribute(n, "color", "rgba(255,255,255,0.08)");
-        });
-        graph.edges().forEach((e) => graph!.dropEdge(e));
+        // 1. Alte Kanten löschen, Fokus setzen (Dimmen übernimmt der Reducer)
+        graph.clearEdges();
+        selCenter = nodeId;
+        selCited = new Set();
+        renderer.refresh();
 
-        // 2. Den Fokus-Knoten hervorheben
-        graph.setNodeAttribute(nodeId, "color", "#00ff88");
-
-        let paper = paperCache.get(nodeId);
-
-        // --- NEU: Zitationen nachladen, falls die Liste leer ist ---
-        if (
-            paper &&
-            paper.citations.length === 0 &&
-            (paper.non_arxiv_citation_count ?? 0) === 0
-        ) {
-            try {
-                const res = await fetch(
-                    `${apiBaseUrl}/papers/${encodeURIComponent(nodeId)}`,
-                );
-                if (res.ok) {
-                    const fullPaper = await res.json();
-                    paper.citations = fullPaper.citations || [];
-                    // Cache aktualisieren
-                    paperCache.set(nodeId, paper);
-                }
-            } catch (e) {
-                console.error("Graph: Failed to fetch citation details", e);
-            }
-        }
+        // 2. Zitationen nachladen, falls nötig
+        const paper = await ensureDetails(nodeId);
+        if (!graph || !renderer || selCenter !== nodeId) return;
 
         // 3. Kanten zu Zitationen zeichnen (falls diese im Graphen existieren)
         if (paper) {
-            paper.citations.forEach((cid) => {
-                if (graph!.hasNode(cid)) {
-                    graph!.setNodeAttribute(cid, "color", "#ffcc00");
-                    graph!.addEdge(nodeId, cid, {
-                        color: "rgba(255,255,255,0.3)",
-                        size: 1.5, // Etwas dicker für bessere Sichtbarkeit
-                    });
-                }
-            });
+            for (const cid of paper.citations) {
+                if (!graph.hasNode(cid) || selCited.has(cid)) continue;
+                selCited.add(cid);
+                graph.addEdge(nodeId, cid, {
+                    color: "rgba(255,255,255,0.3)",
+                    size: 1.5, // Etwas dicker für bessere Sichtbarkeit
+                });
+            }
         }
-
-        selectedNode = nodeId;
         renderer.refresh();
+    }
+
+    // ─── Details bei Bedarf nachladen ───────────────────────────────────
+    // Punkte aus /papers/points enthalten nur ID, Koordinaten und
+    // Zitationszahlen. Titel, Autoren, Abstract kommen erst bei Hover/Klick.
+    // Laufende Requests werden pro Paper geteilt, damit Hover + Klick nicht
+    // doppelt laden.
+    const detailRequests = new Map<string, Promise<Paper | null>>();
+    const detailsAbort = new AbortController();
+
+    /** Paper aus dem Cache oder (ohne Details) aus der Punktwolke. */
+    function getPaper(entryId: string): Paper | null {
+        const cached = paperCache.get(entryId);
+        if (cached) return cached;
+        if (!graph || !graph.hasNode(entryId)) return null;
+        const i = graph.getNodeAttribute(entryId, "i");
+        return typeof i === "number" ? pointToPaper(points, i) : null;
+    }
+
+    function ensureDetails(entryId: string): Promise<Paper | null> {
+        const cached = paperCache.get(entryId);
+        if (cached && cached.detailsLoaded !== false)
+            return Promise.resolve(cached);
+        let req = detailRequests.get(entryId);
+        if (!req) {
+            req = fetchPaperDetails(apiBaseUrl, entryId, detailsAbort.signal)
+                .then((details) => {
+                    const point = getPaper(entryId);
+                    if (!details || !point) return null;
+                    const full = mergeDetails(point, details);
+                    cachePaper(full);
+                    return full;
+                })
+                .catch(() => null)
+                .finally(() => detailRequests.delete(entryId));
+            detailRequests.set(entryId, req);
+        }
+        return req;
     }
 
     onMount(() => {
         if (!container) return;
         graph = new GraphLib();
 
+        const N = n;
+        const { ids, x: px, y: py, cc, nc } = points;
+
         // Compute max total citations for node sizing (stored at module level
         // so that nodes added later for highlights use the same scale).
         maxCit = 0;
-        papers.forEach((p) => {
-            const c = totalCitations(p);
+        for (let i = 0; i < N; i++) {
+            const c = cc[i] + nc[i];
             if (c > maxCit) maxCit = c;
-        });
+        }
 
-        papers.forEach((paper, i) => {
-            // Use UMAP coordinates (tsne1/tsne2) when available, fallback to spiral
-            const hasUmap = paper.tsne1 !== 0 || paper.tsne2 !== 0;
-            if (!hasUmap) {
-                console.warn(
-                    `Paper ${paper.entry_id} is missing UMAP coordinates, using fallback layout. Consider re-running t-SNE/UMAP preprocessing for better visualization.`,
-                );
-            }
-            const x = hasUmap
-                ? paper.tsne1 * COORD_SCALE
-                : 6 *
-                  Math.sqrt(i + 1) *
-                  Math.cos(i * Math.PI * (3 - Math.sqrt(5)));
-            const y = hasUmap
-                ? paper.tsne2 * COORD_SCALE
-                : 6 *
-                  Math.sqrt(i + 1) *
-                  Math.sin(i * Math.PI * (3 - Math.sqrt(5)));
-
-            const cit = totalCitations(paper);
-            // bei cit == maxCit => 2 + 8 = 10
+        // Positionen + Größen auf Typed Arrays vorberechnen, Spread darauf
+        // anwenden und erst danach jeden Knoten genau einmal einfügen.
+        const xs = new Float64Array(N);
+        const ys = new Float64Array(N);
+        const sizes = new Float64Array(N);
+        let missingUmap = 0;
+        for (let i = 0; i < N; i++) {
+            // Use UMAP coordinates when available, fallback to spiral
+            const hasUmap = px[i] !== 0 || py[i] !== 0;
+            if (!hasUmap) missingUmap++;
+            const angle = i * Math.PI * (3 - Math.sqrt(5));
+            xs[i] = hasUmap
+                ? px[i] * COORD_SCALE
+                : 6 * Math.sqrt(i + 1) * Math.cos(angle);
+            ys[i] = hasUmap
+                ? py[i] * COORD_SCALE
+                : 6 * Math.sqrt(i + 1) * Math.sin(angle);
+            const cit = cc[i] + nc[i];
             // normal sind nodes 2 einheiten groß. wachsen bis zu faktor 6 bei sehr vielen zitationen
-            const size = 2 + (maxCit > 0 ? (cit / maxCit) * 4 : 0);
-            const alpha = 0.4 + (maxCit > 0 ? (cit / maxCit) * 0.6 : 0.3);
-            const rgb = hexToRgb(categoryColor);
-            const color = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${alpha})`;
+            sizes[i] = 2 + (maxCit > 0 ? (cit / maxCit) * 4 : 0);
+        }
 
-            graph!.addNode(paper.entry_id, {
-                x,
-                y,
-                x0: x,
-                y0: y,
-                size,
-                label: paper.title,
-                color,
-                originalColor: color,
-                zIndex: Math.ceil(size),
-            });
-            paperCache.set(paper.entry_id, paper);
-        });
+        if (missingUmap > 0) {
+            console.warn(
+                `${missingUmap} papers without UMAP coordinates, using fallback layout.`,
+            );
+        }
 
         // Apply spread to prevent overlapping nodes
-        applySpread(graph);
+        applySpread(xs, ys, sizes);
+
+        // Farbe hängt nur von Kategorie + (gerundeter) Zitationszahl ab →
+        // Strings werden geteilt statt pro Knoten neu erzeugt.
+        const rgb = hexToRgb(categoryColor);
+        const colorByAlpha = new Map<number, string>();
+        for (let i = 0; i < N; i++) {
+            const cit = cc[i] + nc[i];
+            const alphaKey = Math.round(
+                (0.4 + (maxCit > 0 ? (cit / maxCit) * 0.6 : 0.3)) * 100,
+            );
+            let color = colorByAlpha.get(alphaKey);
+            if (!color) {
+                color = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${alphaKey / 100})`;
+                colorByAlpha.set(alphaKey, color);
+            }
+            if (graph.hasNode(ids[i])) continue; // doppelte IDs ignorieren
+            graph.addNode(ids[i], {
+                x: xs[i],
+                y: ys[i],
+                size: sizes[i],
+                color,
+                zIndex: Math.ceil(sizes[i]),
+                i, // Index in `points` für Details/Tooltip
+            });
+        }
 
         renderer = new Sigma(graph, container, {
             renderEdgeLabels: false,
@@ -584,12 +633,40 @@
             renderLabels: false,
             labelRenderedSizeThreshold: 8,
             zIndex: true,
+            nodeReducer: (node, data) => {
+                if (hlActive) {
+                    const minSize = hlNodes.get(node);
+                    if (minSize !== undefined)
+                        return {
+                            ...data,
+                            color: hlColor,
+                            size: Math.max(data.size, minSize),
+                            zIndex: (data.zIndex ?? 0) + 10,
+                        };
+                    return { ...data, color: DIM_COLOR };
+                }
+                if (selCenter) {
+                    if (node === selCenter)
+                        return { ...data, color: "#00ff88", zIndex: 20 };
+                    if (selCited.has(node))
+                        return { ...data, color: "#ffcc00", zIndex: 15 };
+                    return { ...data, color: DIM_COLOR };
+                }
+                return data;
+            },
         });
 
         renderer.on("enterNode", ({ node }) => {
             if (hoverTimeout) clearTimeout(hoverTimeout);
             hoverTimeout = setTimeout(() => {
-                hoveredPaper = paperCache.get(node) || null;
+                hoveredPaper = getPaper(node);
+                if (hoveredPaper && hoveredPaper.detailsLoaded === false) {
+                    ensureDetails(node).then((full) => {
+                        // nur übernehmen, wenn der Nutzer noch auf dem Knoten ist
+                        if (full && hoveredPaper?.entry_id === node)
+                            hoveredPaper = full;
+                    });
+                }
             }, 150) as unknown as number;
         });
         renderer.on("leaveNode", () => {
@@ -597,34 +674,44 @@
             hoveredPaper = null;
         });
 
-        renderer.on("clickNode", ({ node }) => {
-            const paper = paperCache.get(node);
-            if (paper) dispatch("paperSelected", paper);
+        renderer.on("clickNode", async ({ node }) => {
+            const paper = getPaper(node);
+            if (!paper) return;
+            // Detailansicht braucht Titel, Autoren usw. → vorher nachladen
+            const full =
+                paper.detailsLoaded === false
+                    ? ((await ensureDetails(node)) ?? paper)
+                    : paper;
+            if (!renderer) return; // Komponente inzwischen zerstört
+            hoveredPaper = null;
+            dispatch("paperSelected", full);
         });
 
         renderer.on("clickStage", () => {
             selectedNode = null;
             hoveredPaper = null;
-            if (graph) {
-                graph.forEachNode((n) => {
-                    graph!.setNodeAttribute(
-                        n,
-                        "color",
-                        graph!.getNodeAttribute(n, "originalColor"),
-                    );
-                });
-                graph.edges().forEach((e) => graph!.dropEdge(e));
-            }
+            selCenter = null;
+            selCited = new Set();
+            // wie bisher: Klick ins Leere setzt auch die Highlight-Färbung zurück
+            hlActive = false;
+            graph?.clearEdges();
             renderer!.refresh();
             dispatch("nodeDeselected");
         });
 
+        // Highlights, die vor dem Mount gesetzt wurden, jetzt anwenden
+        applyGraphHighlights(searchHighlightPapers, authorHighlight);
+
         return () => {
             if (hoverTimeout) clearTimeout(hoverTimeout);
+            authorHighlightToken++;
+            detailsAbort.abort();
+            detailRequests.clear();
             if (renderer) {
                 renderer.kill();
                 renderer = null;
             }
+            graph = null;
             paperCache.clear();
         };
     });
@@ -641,6 +728,9 @@
 
     {#if hoveredPaper}
         <div class="tooltip">
+            {#if hoveredPaper.detailsLoaded === false}
+                <p class="meta">Lade Details…</p>
+            {:else}
             <h4>{hoveredPaper.title}</h4>
             <p class="meta">{hoveredPaper.authors}</p>
             <p class="meta">
@@ -659,6 +749,7 @@
                     .references.length} | Non-arXiv: {(hoveredPaper.non_arxiv_citation_count ??
                     0) + (hoveredPaper.non_arxiv_reference_count ?? 0)}
             </p>
+            {/if}
         </div>
     {/if}
 </div>

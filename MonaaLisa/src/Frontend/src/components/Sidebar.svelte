@@ -12,7 +12,7 @@
       highlight/add nodes whose authors match the search term
 -->
 <script lang="ts">
-    import { createEventDispatcher, tick } from "svelte";
+    import { createEventDispatcher, onDestroy, tick } from "svelte";
     import { env as publicEnv } from "$env/dynamic/public";
     import type { Paper } from "$lib/types/paper";
     import { getClusterColor } from "../utils/clusterColors";
@@ -59,6 +59,8 @@
     let searchLoading = false;
     let searchError: string | null = null;
     let searchTotal = 0;
+    /** Backend kappt `total` bei 10000 und setzt dann totalCapped. */
+    let searchTotalCapped = false;
 
     // Advanced filter form type - each field maps to a backend query param
     const TODAY = new Date().toISOString().slice(0, 10);
@@ -148,7 +150,28 @@
     let searchTimer: ReturnType<typeof setTimeout> | null = null;
     let query = "";
 
+    // Jede neue Suche bricht die vorherige ab; die Sequenznummer verhindert,
+    // dass eine verspätete Antwort neuere Ergebnisse (oder ein clearSearch)
+    // überschreibt.
+    const MIN_SEARCH_LEN = 3; // Backend verlangt >= 3 Zeichen für `search`
+    const MAX_NEIGHBOUR_IDS = 20000; // Backend-Limit für /neighbours/filtered
+    let searchAbort: AbortController | null = null;
+    let searchSeq = 0;
+
+    function cancelSearch() {
+        searchAbort?.abort();
+        searchAbort = null;
+        searchSeq++;
+        searchLoading = false;
+    }
+
+    onDestroy(() => {
+        if (searchTimer) clearTimeout(searchTimer);
+        cancelSearch();
+    });
+
     async function runSearch() {
+        cancelSearch();
         if (!validateAdv()) return;
         const trimmed = query.trim();
         const hasAdv = !!(
@@ -165,8 +188,14 @@
             return;
         }
 
+        const ctrl = new AbortController();
+        searchAbort = ctrl;
+        const seq = searchSeq;
+        const isStale = () => seq !== searchSeq || ctrl.signal.aborted;
+
         searchLoading = true;
         searchError = null;
+        let results: Paper[] = [];
 
         try {
             // ENTSCHEIDUNG: Global oder Nachbarschaft?
@@ -180,8 +209,12 @@
                     {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
+                        signal: ctrl.signal,
                         body: JSON.stringify({
-                            entryIds: currentNeighbourIds,
+                            entryIds: currentNeighbourIds.slice(
+                                0,
+                                MAX_NEIGHBOUR_IDS,
+                            ),
                             filter: {
                                 authorQuery:
                                     adv.authorQuery.trim() || undefined,
@@ -197,10 +230,12 @@
 
                 if (!res.ok) throw new Error(`Server error ${res.status}`);
                 const rawItems = await res.json();
+                if (isStale()) return;
 
                 // Mapping der Ergebnisse (wie gewohnt)
-                searchResults = rawItems.map(mapPaperResponse);
-                searchTotal = searchResults.length;
+                results = rawItems.map(mapPaperResponse) as Paper[];
+                searchTotal = results.length;
+                searchTotalCapped = false;
             } else {
                 // --- PFAD B: Globale Suche (GET - dein bestehender Code) ---
                 const params = new URLSearchParams();
@@ -224,7 +259,15 @@
 
                 if (searchParts.length > 0) {
                     // Wir begrenzen die Länge, um keine zu riesigen Header zu senden
-                    params.set("search", searchParts.join(" ").slice(0, 300));
+                    const combined = searchParts.join(" ").slice(0, 300);
+                    if (combined.length < MIN_SEARCH_LEN) {
+                        // Backend lehnt kürzere Suchbegriffe ab → kein Request
+                        searchError = `Please enter at least ${MIN_SEARCH_LEN} characters.`;
+                        searchResults = null;
+                        dispatch("searchHighlight", []);
+                        return;
+                    }
+                    params.set("search", combined);
                 }
 
                 // 3. Datumsfilter
@@ -245,25 +288,34 @@
 
                 const res = await fetch(
                     `${apiBaseUrl}/papers?${params.toString()}`,
+                    { signal: ctrl.signal },
                 );
                 if (!res.ok) throw new Error(`Server error ${res.status}`);
                 const payload = await res.json();
+                if (isStale()) return;
                 const rawItems = Array.isArray(payload)
                     ? payload
                     : (payload?.items ?? []);
                 searchTotal = Array.isArray(payload)
                     ? rawItems.length
                     : (payload?.total ?? rawItems.length);
+                searchTotalCapped =
+                    !Array.isArray(payload) && payload?.totalCapped === true;
 
-                searchResults = rawItems.map(mapPaperResponse);
+                results = rawItems.map(mapPaperResponse) as Paper[];
             }
 
-            dispatch("searchHighlight", searchResults);
+            searchResults = results;
+            dispatch("searchHighlight", results);
         } catch (e) {
+            if (isStale()) return;
             searchError = e instanceof Error ? e.message : "Search failed.";
             searchResults = null;
         } finally {
-            searchLoading = false;
+            if (seq === searchSeq) {
+                searchLoading = false;
+                if (searchAbort === ctrl) searchAbort = null;
+            }
         }
     }
 
@@ -341,6 +393,7 @@
             !adv.dateTo &&
             !adv.authorQuery.trim()
         ) {
+            cancelSearch();
             searchResults = null;
             searchError = null;
             // Notify the graph that there are no active search results to highlight.
@@ -351,6 +404,7 @@
     }
 
     function clearSearch() {
+        cancelSearch();
         query = "";
         searchResults = null;
         searchError = null;
@@ -617,7 +671,7 @@
                         on:click={applyAdvancedSearch}>Search</button
                     >
                     {#if searchTotal > 0}<span class="adv-count"
-                            >{searchTotal} result{searchTotal !== 1
+                            >{searchTotal}{searchTotalCapped ? "+" : ""} result{searchTotal !== 1
                                 ? "s"
                                 : ""}</span
                         >{/if}

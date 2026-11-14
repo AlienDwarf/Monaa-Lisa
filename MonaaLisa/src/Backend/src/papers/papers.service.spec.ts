@@ -7,14 +7,15 @@
  */
 import { Test, TestingModule } from '@nestjs/testing';
 import { PapersService } from './papers.service';
+import { PrismaService } from '../prisma/prisma.service';
 
 describe('PaperService', () => {
   let service: PapersService;
 
   beforeEach(async () => {
-    // Minimal-Variante (ohne Mock) – Provoziert DI-Fehler bewusst.
+    // PrismaService wird gemockt – der Smoke-Test braucht keine Datenbank.
     const module: TestingModule = await Test.createTestingModule({
-      providers: [PapersService],
+      providers: [PapersService, { provide: PrismaService, useValue: {} }],
     }).compile();
 
     service = module.get<PapersService>(PapersService);

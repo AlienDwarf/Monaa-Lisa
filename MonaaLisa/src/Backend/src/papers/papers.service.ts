@@ -3,7 +3,55 @@ import { PrismaService } from '../prisma/prisma.service';
 import { Prisma } from '@prisma/client';
 import { CreatePaperDto } from './dto/create-paper.dto';
 import { UpdatePaperDto } from './dto/update-paper.dto';
-import { QueryPaperDto } from './dto/query-paper.dto';
+import {
+  COUNT_CAP,
+  MAX_PAGE_SIZE,
+  MAX_SKIP,
+  NeighbourFilterDto,
+  QueryPaperDto,
+} from './dto/query-paper.dto';
+import { CachedPayload, PointsCache } from './points-cache';
+
+/** Titel von Platzhalter-Zeilen, die nie ausgeliefert werden. */
+export const STUB_TITLE = '[STUB] Pending Fetch';
+
+/** Max. Zitationen/Referenzen, die an ein einzelnes Paper angehängt werden. */
+const MAX_INLINE_LINKS = 10_000;
+
+/**
+ * Spaltenorientierte Punktwolke einer Kategorie (GET /papers/points).
+ * Index i in allen Arrays gehört zum selben Paper. Spalten statt Objekte,
+ * weil das JSON dadurch etwa halb so groß ist und schneller geparst wird.
+ */
+export interface CategoryPoints {
+  category: string;
+  count: number;
+  ids: string[];
+  x: number[];
+  y: number[];
+  /** arXiv-interne Zitationen (Zeilen in paper_citation) */
+  cc: number[];
+  /** Zitationen von außerhalb arXiv */
+  nc: number[];
+}
+
+type PointRow = {
+  id: string;
+  x: number;
+  y: number;
+  cc: number;
+  nc: number | null;
+};
+
+function envInt(name: string, fallback: number): number {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) && v > 0 ? v : fallback;
+}
+
+/** Auf 4 Nachkommastellen runden – hält das JSON klein. */
+function round4(v: number): number {
+  return Math.round(v * 1e4) / 1e4;
+}
 
 /**
  * PapersService Nico
@@ -20,12 +68,18 @@ import { QueryPaperDto } from './dto/query-paper.dto';
 export class PapersService {
   constructor(private prisma: PrismaService) {}
 
+  private readonly pointsCache = new PointsCache(
+    envInt('POINTS_CACHE_MB', 256) * 1024 * 1024,
+    envInt('POINTS_CACHE_TTL_S', 3600) * 1000,
+  );
+
   /**
    * Legt ein neues Paper an.
    * - `published` ist optional → wenn nicht da, speichern wir `null`
    * - `added` ist der Zeitpunkt, zu dem wir es in unser System aufnehmen
    */
   async create(dto: CreatePaperDto) {
+    this.pointsCache.clear(); // Punktwolken können sich geändert haben
     return this.prisma.paper.create({
       data: {
         entry_id: dto.entry_id,
@@ -33,6 +87,7 @@ export class PapersService {
         authors: authorsToString(dto.authors) ?? null,
         abstract: dto.abstract ?? null,
         categories: dto.categories ?? null,
+        ...deriveCategoryColumns(dto.categories),
         published: dto.published ? new Date(dto.published) : null,
         updated: dto.updated ? new Date(dto.updated) : null,
         doi: dto.doi ?? null,
@@ -52,21 +107,22 @@ export class PapersService {
    */
   async findFilteredNeighbours(
     entryIds: string[],
-    filter: {
-      dateFrom?: string;
-      dateTo?: string;
-      authorQuery?: string;
-      abstractQuery?: string;
-      minCitations?: number;
-      // onlyArxiv wird implizit behandelt, da non-arXiv Paper
-      // oft eh nicht in der Haupt-Tabelle liegen oder keine validen Daten haben.
-    },
+    filter: NeighbourFilterDto = {},
   ) {
     if (!entryIds || entryIds.length === 0) return [];
 
+    // Kandidaten sind über den Unique-Index auf entry_id eingegrenzt; die
+    // restlichen Filter laufen nur noch über diese (max. 20k) Zeilen.
     const where: Prisma.PaperWhereInput = {
-      entry_id: { in: entryIds },
+      entry_id: { in: [...new Set(entryIds)] },
+      title: { not: STUB_TITLE },
     };
+
+    if (filter.titleQuery && filter.titleQuery.trim() !== '') {
+      where.AND = [
+        { title: { contains: filter.titleQuery.trim(), mode: 'insensitive' } },
+      ];
+    }
 
     // 1. Datumsfilter
     if (filter.dateFrom || filter.dateTo) {
@@ -126,6 +182,7 @@ export class PapersService {
    * Warum? Ingestion kann dasselbe Item mehrfach sehen – hiermit vermeiden wir Duplikate.
    */
   async upsertByEntryId(dto: CreatePaperDto) {
+    this.pointsCache.clear(); // Punktwolken können sich geändert haben
     return this.prisma.paper.upsert({
       where: { entry_id: dto.entry_id },
       update: {
@@ -133,6 +190,7 @@ export class PapersService {
         authors: authorsToString(dto.authors) ?? null,
         abstract: dto.abstract ?? null,
         categories: dto.categories ?? null,
+        ...deriveCategoryColumns(dto.categories),
         published: dto.published ? new Date(dto.published) : null,
         updated: dto.updated ? new Date(dto.updated) : null,
         doi: dto.doi ?? null,
@@ -149,6 +207,7 @@ export class PapersService {
         authors: authorsToString(dto.authors) ?? null,
         abstract: dto.abstract ?? null,
         categories: dto.categories ?? null,
+        ...deriveCategoryColumns(dto.categories),
         published: dto.published ? new Date(dto.published) : null,
         updated: dto.updated ? new Date(dto.updated) : null,
         doi: dto.doi ?? null,
@@ -170,26 +229,15 @@ export class PapersService {
   // `MonaaLisa/src/Backend/src/papers/papers.service.ts`
 
   async findMany(q: QueryPaperDto) {
-    const skip = toNumber(q.skip, 0);
-    const take = toNumber(q.take, Math.pow(2, 31) - 1);
-
-    // ── sort=citations → raw SQL path (order by citation count DESC) ──
-    if (
-      q.sort === 'citations' &&
-      q.categories &&
-      !q.search &&
-      !q.dateFrom &&
-      !q.dateTo
-    ) {
-      return this.findManyByCitationCount(q.categories, skip, take);
-    }
+    const skip = Math.min(Math.max(0, toNumber(q.skip, 0)), MAX_SKIP);
+    // Zweite Sicherung zusätzlich zur ValidationPipe: nie unbegrenzt laden.
+    const take = Math.min(Math.max(1, toNumber(q.take, 20)), MAX_PAGE_SIZE);
 
     const where: Prisma.PaperWhereInput = {};
 
-    // Stub-Titel grundsätzlich ausschließen
-    where.NOT = [
-      { title: { equals: '[STUB] Pending Fetch', mode: 'insensitive' } },
-    ];
+    // Stub-Titel grundsätzlich ausschließen (exakter Vergleich: billiger
+    // Filter auf schon gefundenen Zeilen statt ILIKE)
+    where.title = { not: STUB_TITLE };
 
     if (q.search && q.search.trim() !== '') {
       const term = q.search.trim();
@@ -200,7 +248,7 @@ export class PapersService {
       ];
     }
 
-    if (q.categories) where.categories = { contains: q.categories };
+    if (q.categories) Object.assign(where, categoryWhere(q.categories));
 
     if (q.dateFrom || q.dateTo) {
       const publishedFilter: Prisma.DateTimeNullableFilter = {};
@@ -209,72 +257,129 @@ export class PapersService {
       where.published = publishedFilter;
     }
 
-    const [items, total] = await Promise.all([
-      this.prisma.paper.findMany({
-        where,
-        orderBy: [{ published: 'desc' }],
-        skip,
-        take,
-      }),
-      this.prisma.paper.count({ where }),
-    ]);
+    // sort=citations nutzt die vorberechnete Spalte arxiv_citation_count
+    // (indiziert) statt bei jeder Anfrage paper_citation zu zählen.
+    // Immer mit eindeutigem Tiebreaker, sonst ist die Reihenfolge bei
+    // gleichen Werten zufällig und Seiten überlappen.
+    const orderBy: Prisma.PaperOrderByWithRelationInput[] =
+      q.sort === 'citations'
+        ? [{ arxiv_citation_count: 'desc' }, { id: 'asc' }]
+        : [{ published: 'desc' }, { id: 'desc' }];
 
-    const shouldEnrich = take <= 40;
+    const items = await this.prisma.paper.findMany({
+      where,
+      orderBy,
+      skip,
+      take,
+    });
+
+    // Gesamtanzahl: Ein exaktes COUNT über Millionen Zeilen kostet bei jeder
+    // Anfrage Sekunden. Deshalb:
+    // - letzte Seite schon erreicht → Anzahl ergibt sich direkt
+    // - sonst höchstens COUNT_CAP+1 IDs holen (bricht früh ab) → "10000+"
+    let total: number;
+    let totalCapped = false;
+    if (items.length < take) {
+      total = skip + items.length;
+    } else {
+      const ids = await this.prisma.paper.findMany({
+        where,
+        select: { id: true },
+        take: COUNT_CAP + 1,
+      });
+      totalCapped = ids.length > COUNT_CAP;
+      total = Math.min(ids.length, COUNT_CAP);
+    }
+
+    // Zitationslisten nur für kleine Seiten anhängen (z. B. Sidebar-Samples)
+    const shouldEnrich = take <= 50;
 
     const enrichedItems = shouldEnrich
       ? await this.enrichWithCitations(items)
       : items.map((p) => ({ ...p, citations: [], references: [] }));
 
-    return { items: enrichedItems, total, skip, take };
+    return { items: enrichedItems, total, totalCapped, skip, take };
   }
 
   /**
-   * Optimised path: fetches papers for a category ordered by citation count.
-   * Uses raw SQL because Prisma cannot ORDER BY a count from a joined table.
+   * Punktwolke einer Kategorie für die Karte: nur ID, UMAP-Koordinaten und
+   * Zitationszahlen – kein Abstract, keine Zitationslisten. Details lädt das
+   * Frontend bei Hover/Klick über GET /papers/:entryId nach.
+   *
+   * Sortiert nach arXiv-Zitationen (absteigend), damit `limit` die
+   * meistzitierten Paper liefert. Ohne `limit` kommt die ganze Kategorie.
+   *
+   * Liefert fertig serialisierte Bytes (JSON + gzip) aus dem PointsCache.
    */
-  private async findManyByCitationCount(
-    category: string,
-    skip: number,
-    take: number,
-  ) {
-    const papers: any[] = await this.prisma.$queryRaw`
-      SELECT p.*,
-             COALESCE(cc.cnt, 0) AS cit_count
+  getPointsPayload(category: string, limit?: number): Promise<CachedPayload> {
+    return this.pointsCache.get(`${category}|${limit ?? 'all'}`, () =>
+      this.findPoints(category, limit),
+    );
+  }
+
+  /**
+   * Nutzt die generierten Spalten point_x/point_y. Für Präfix-Kategorien
+   * ("cs.") deckt paper_points_prefix_idx die Abfrage komplett ab
+   * (Index-Only-Scan – die breiten Zeilen mit Abstract werden nicht gelesen).
+   */
+  async findPoints(category: string, limit?: number): Promise<CategoryPoints> {
+    const limitSql = limit ? Prisma.sql`LIMIT ${limit}` : Prisma.empty;
+
+    const rows: PointRow[] = await this.prisma.$queryRaw`
+      SELECT p.entry_id AS id,
+             p.point_x AS x,
+             p.point_y AS y,
+             p.arxiv_citation_count AS cc,
+             p.non_arxiv_citation_count AS nc
         FROM paper p
-        LEFT JOIN (
-          SELECT belonging_paper_entry_id, COUNT(*) AS cnt
-            FROM paper_citation
-           GROUP BY belonging_paper_entry_id
-        ) cc ON cc.belonging_paper_entry_id = p.entry_id
-       WHERE p.categories LIKE ${'%' + category + '%'}
-         AND LOWER(p.title) != '[stub] pending fetch'
-       ORDER BY cit_count DESC
-       OFFSET ${skip}
-        LIMIT ${take}
+       WHERE ${categorySql(category)}
+         AND p.point_x IS NOT NULL
+         AND p.point_y IS NOT NULL
+       ORDER BY p.arxiv_citation_count DESC, p.entry_id
+       ${limitSql}
     `;
 
-    const total: [{ count: bigint }] = await this.prisma.$queryRaw`
-      SELECT COUNT(*) as count FROM paper
-       WHERE categories LIKE ${'%' + category + '%'}
-         AND LOWER(title) != '[stub] pending fetch'
+    const n = rows.length;
+    const out: CategoryPoints = {
+      category,
+      count: n,
+      ids: new Array<string>(n),
+      x: new Array<number>(n),
+      y: new Array<number>(n),
+      cc: new Array<number>(n),
+      nc: new Array<number>(n),
+    };
+    for (let i = 0; i < n; i++) {
+      const r = rows[i];
+      out.ids[i] = r.id;
+      out.x[i] = round4(Number(r.x));
+      out.y[i] = round4(Number(r.y));
+      out.cc[i] = Number(r.cc);
+      out.nc[i] = Number(r.nc ?? 0);
+    }
+    return out;
+  }
+
+  /**
+   * IDs aller Paper einer Kategorie, deren Autorenfeld `author` enthält
+   * (case-insensitive). Nutzt den Trigram-Index auf `authors` und den
+   * GIN-Index auf `category_list`.
+   * Liefert nur IDs, damit auch Autoren mit hunderten Papern vollständig
+   * hervorgehoben werden können. Hartes Limit als Sicherheitsgurt.
+   */
+  async findAuthorPaperIds(
+    category: string,
+    author: string,
+  ): Promise<{ ids: string[] }> {
+    const rows: { entry_id: string }[] = await this.prisma.$queryRaw`
+      SELECT p.entry_id
+        FROM paper p
+       WHERE ${categorySql(category)}
+         AND p.authors ILIKE ${'%' + escapeLike(author.trim()) + '%'}
+         AND p.point_x IS NOT NULL
+       LIMIT ${AUTHOR_IDS_LIMIT}
     `;
-
-    // Raw query returns BigInt for count columns – convert to number
-    const items = papers.map(({ cit_count, ...rest }) => ({
-      ...rest,
-      id: Number(rest.id),
-      non_arxiv_citation_count:
-        rest.non_arxiv_citation_count != null
-          ? Number(rest.non_arxiv_citation_count)
-          : null,
-      non_arxiv_reference_count:
-        rest.non_arxiv_reference_count != null
-          ? Number(rest.non_arxiv_reference_count)
-          : null,
-    }));
-
-    const enrichedItems = await this.enrichWithCitations(items as any);
-    return { items: enrichedItems, total: Number(total[0].count), skip, take };
+    return { ids: rows.map((r) => r.entry_id) };
   }
 
   /**
@@ -282,17 +387,19 @@ export class PapersService {
    * Wirft, wenn es die ID nicht gibt → bewusst, damit der Caller entscheiden kann.
    */
   async findByEntryId(entry_id: string) {
-    const paper = await this.prisma.paper.findUniqueOrThrow({
-      where: { entry_id },
-    });
-    const [citations, references] = await Promise.all([
+    // Alle drei Abfragen laufen über Primär-/Unique-Indizes. Die Listen sind
+    // gedeckelt, damit stark zitierte Paper nicht bei jedem Hover MB laden.
+    const [paper, citations, references] = await Promise.all([
+      this.prisma.paper.findUniqueOrThrow({ where: { entry_id } }),
       this.prisma.paperCitation.findMany({
         where: { belonging_paper_entry_id: entry_id },
         select: { cited_paper_entry_id: true },
+        take: MAX_INLINE_LINKS,
       }),
       this.prisma.paperReference.findMany({
         where: { belonging_paper_entry_id: entry_id },
         select: { referenced_paper_entry_id: true },
+        take: MAX_INLINE_LINKS,
       }),
     ]);
     return {
@@ -308,6 +415,7 @@ export class PapersService {
    * - `published`: wenn nicht gesetzt, bleibt der vorhandene Wert (via `undefined`)
    */
   async updateByEntryId(entry_id: string, dto: UpdatePaperDto) {
+    this.pointsCache.clear(); // Punktwolken können sich geändert haben
     return this.prisma.paper.update({
       where: { entry_id },
       data: {
@@ -316,6 +424,9 @@ export class PapersService {
           dto.authors === undefined ? undefined : authorsToString(dto.authors),
         abstract: dto.abstract,
         categories: dto.categories,
+        ...(dto.categories === undefined
+          ? {}
+          : deriveCategoryColumns(dto.categories)),
         published: dto.published ? new Date(dto.published) : undefined,
         updated: dto.updated ? new Date(dto.updated) : undefined,
         doi: dto.doi,
@@ -331,12 +442,12 @@ export class PapersService {
 
   /**
    * Batch-Fetch: holt mehrere Papers anhand einer Liste von `entry_id`s.
-   * Maximal 5000 Ergebnisse.
+   * Anzahl IDs ist im DTO auf MAX_BATCH_IDS begrenzt.
    */
-  async findByEntryIds(entryIds: string[], take = 5000) {
+  async findByEntryIds(entryIds: string[]) {
+    if (!entryIds.length) return [];
     const papers = await this.prisma.paper.findMany({
-      where: { entry_id: { in: entryIds } },
-      take,
+      where: { entry_id: { in: [...new Set(entryIds)] } },
     });
 
     // Falls jemand 5000 IDs anfragt, NIEMALS enrichWithCitations machen
@@ -358,18 +469,37 @@ export class PapersService {
 
     const entryIds = papers.map((p) => p.entry_id);
 
+    // Pro Paper höchstens LIST_LINKS_PER_PAPER Einträge (LATERAL + LIMIT).
+    // Die Sidebar lädt gerade die meistzitierten Paper – ohne Deckel wären
+    // das schnell Hunderttausende Zeilen für eine Liste mit 50 Einträgen.
     const [citRows, refRows] = await Promise.all([
-      this.prisma.paperCitation.findMany({
-        where: { belonging_paper_entry_id: { in: entryIds } },
-        select: { belonging_paper_entry_id: true, cited_paper_entry_id: true },
-      }),
-      this.prisma.paperReference.findMany({
-        where: { belonging_paper_entry_id: { in: entryIds } },
-        select: {
-          belonging_paper_entry_id: true,
-          referenced_paper_entry_id: true,
-        },
-      }),
+      this.prisma.$queryRaw<
+        { belonging_paper_entry_id: string; cited_paper_entry_id: string }[]
+      >`
+        SELECT b.entry_id AS belonging_paper_entry_id, l.cited_paper_entry_id
+          FROM unnest(${entryIds}::text[]) AS b(entry_id)
+          CROSS JOIN LATERAL (
+            SELECT pc.cited_paper_entry_id
+              FROM paper_citation pc
+             WHERE pc.belonging_paper_entry_id = b.entry_id
+             LIMIT ${LIST_LINKS_PER_PAPER}
+          ) l
+      `,
+      this.prisma.$queryRaw<
+        {
+          belonging_paper_entry_id: string;
+          referenced_paper_entry_id: string;
+        }[]
+      >`
+        SELECT b.entry_id AS belonging_paper_entry_id, l.referenced_paper_entry_id
+          FROM unnest(${entryIds}::text[]) AS b(entry_id)
+          CROSS JOIN LATERAL (
+            SELECT pr.referenced_paper_entry_id
+              FROM paper_reference pr
+             WHERE pr.belonging_paper_entry_id = b.entry_id
+             LIMIT ${LIST_LINKS_PER_PAPER}
+          ) l
+      `,
     ]);
 
     const citationMap = new Map<string, string[]>();
@@ -402,8 +532,49 @@ export class PapersService {
    * Keine Magie – weg ist weg.
    */
   async deleteByEntryId(entry_id: string) {
+    this.pointsCache.clear(); // Punktwolken können sich geändert haben
     return this.prisma.paper.delete({ where: { entry_id } });
   }
+}
+
+const AUTHOR_IDS_LIMIT = 20000;
+
+/** Max. Zitationen/Referenzen pro Paper in Listenansichten (enrichWithCitations). */
+const LIST_LINKS_PER_PAPER = 1000;
+
+/**
+ * Kategorie-Filter:
+ * - endet auf "." (z. B. "cs.") → Präfix auf primary_category
+ * - sonst exakte Kategorie (z. B. "cs.CL", "hep-ph") → category_list enthält sie
+ */
+function isPrefixCategory(category: string): boolean {
+  return category.endsWith('.');
+}
+
+function categoryWhere(category: string): Prisma.PaperWhereInput {
+  return isPrefixCategory(category)
+    ? { primary_category: { startsWith: category } }
+    : { category_list: { has: category } };
+}
+
+function categorySql(category: string): Prisma.Sql {
+  return isPrefixCategory(category)
+    ? Prisma.sql`p.primary_category LIKE ${escapeLike(category) + '%'}`
+    : Prisma.sql`p.category_list @> ARRAY[${category}]::text[]`;
+}
+
+/** Leitet category_list/primary_category aus dem Kategorie-String ab. */
+function deriveCategoryColumns(categories: string | null | undefined): {
+  category_list: string[];
+  primary_category: string | null;
+} {
+  const list = (categories ?? '').split(/[\s,]+/).filter(Boolean);
+  return { category_list: list, primary_category: list[0] ?? null };
+}
+
+/** Maskiert LIKE-Platzhalter (% und _) in Nutzereingaben. */
+function escapeLike(value: string): string {
+  return value.replace(/[\\%_]/g, (c) => '\\' + c);
 }
 
 /**

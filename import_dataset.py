@@ -153,13 +153,63 @@ PAPER_CITATION_COLS = ["belonging_paper_entry_id", "cited_paper_entry_id"]
 PAPER_REFERENCE_COLS = ["belonging_paper_entry_id", "referenced_paper_entry_id"]
 
 
+_PAPER_UPSERT_SET = """
+    title     = EXCLUDED.title,
+    authors   = EXCLUDED.authors,
+    abstract  = EXCLUDED.abstract,
+    categories = EXCLUDED.categories,
+    published = EXCLUDED.published,
+    updated   = EXCLUDED.updated,
+    doi       = EXCLUDED.doi,
+    journal_ref = EXCLUDED.journal_ref,
+    license   = EXCLUDED.license,
+    url       = EXCLUDED.url,
+    s2_id     = EXCLUDED.s2_id,
+    non_arxiv_citation_count  = EXCLUDED.non_arxiv_citation_count,
+    non_arxiv_reference_count = EXCLUDED.non_arxiv_reference_count,
+    related_arxiv_ids = EXCLUDED.related_arxiv_ids,
+    tsne      = EXCLUDED.tsne
+"""
+_S2_IDX = PAPER_COLS.index("s2_id")
+
+
+def _dedupe_papers(rows: list[tuple]) -> list[tuple]:
+    """
+    One row per entry_id (last wins - ON CONFLICT DO UPDATE cannot touch a row
+    twice in one statement) and one row per s2_id (later duplicates get NULL:
+    paper.s2_id is UNIQUE). Without this a single duplicate would push the
+    whole batch into the slow row-by-row fallback.
+    """
+    by_id = {row[0]: row for row in rows}
+    seen_s2: set = set()
+    out = []
+    for row in by_id.values():
+        sid = row[_S2_IDX]
+        if sid is not None:
+            if sid in seen_s2:
+                row = row[:_S2_IDX] + (None,) + row[_S2_IDX + 1:]
+            else:
+                seen_s2.add(sid)
+        out.append(row)
+    return out
+
+
 def flush_papers(conn, rows: list[tuple]):
     """Bulk-insert papers via temp table + ON CONFLICT."""
     if not rows:
         return
+    rows = _dedupe_papers(rows)
     cols = ", ".join(PAPER_COLS)
+    # s2_id already owned by ANOTHER paper -> store NULL instead of failing the batch
+    # (EXISTS uses the unique index on paper.s2_id)
+    select_cols = ", ".join(
+        "CASE WHEN EXISTS (SELECT 1 FROM paper p WHERE p.s2_id = t.s2_id AND p.entry_id <> t.entry_id) "
+        "THEN NULL ELSE t.s2_id END" if c == "s2_id" else f"t.{c}"
+        for c in PAPER_COLS
+    )
     try:
         with conn.cursor() as cur:
+            # Only the columns we write; generated columns (point_x/point_y) are never touched
             cur.execute("""
                 CREATE TEMP TABLE _tmp_paper (LIKE paper INCLUDING DEFAULTS)
                 ON COMMIT DROP;
@@ -174,23 +224,8 @@ def flush_papers(conn, rows: list[tuple]):
 
             cur.execute(f"""
                 INSERT INTO paper ({cols})
-                SELECT {cols} FROM _tmp_paper
-                ON CONFLICT (entry_id) DO UPDATE SET
-                    title     = EXCLUDED.title,
-                    authors   = EXCLUDED.authors,
-                    abstract  = EXCLUDED.abstract,
-                    categories = EXCLUDED.categories,
-                    published = EXCLUDED.published,
-                    updated   = EXCLUDED.updated,
-                    doi       = EXCLUDED.doi,
-                    journal_ref = EXCLUDED.journal_ref,
-                    license   = EXCLUDED.license,
-                    url       = EXCLUDED.url,
-                    s2_id     = EXCLUDED.s2_id,
-                    non_arxiv_citation_count  = EXCLUDED.non_arxiv_citation_count,
-                    non_arxiv_reference_count = EXCLUDED.non_arxiv_reference_count,
-                    related_arxiv_ids = EXCLUDED.related_arxiv_ids,
-                    tsne      = EXCLUDED.tsne;
+                SELECT {select_cols} FROM _tmp_paper t
+                ON CONFLICT (entry_id) DO UPDATE SET {_PAPER_UPSERT_SET};
             """)
         conn.commit()
     except Exception as e:
@@ -200,35 +235,26 @@ def flush_papers(conn, rows: list[tuple]):
 
 
 def _flush_papers_rowwise(conn, cols: str, rows: list[tuple]):
-    """Fallback: insert papers one by one."""
+    """Fallback: insert papers one by one (savepoint per row, ONE commit)."""
     placeholders = ", ".join(["%s"] * len(PAPER_COLS))
     skipped = 0
-    for row in rows:
-        try:
-            with conn.cursor() as cur:
-                cur.execute(f"""
-                    INSERT INTO paper ({cols}) VALUES ({placeholders})
-                    ON CONFLICT (entry_id) DO UPDATE SET
-                        title     = EXCLUDED.title,
-                        authors   = EXCLUDED.authors,
-                        abstract  = EXCLUDED.abstract,
-                        categories = EXCLUDED.categories,
-                        published = EXCLUDED.published,
-                        updated   = EXCLUDED.updated,
-                        doi       = EXCLUDED.doi,
-                        journal_ref = EXCLUDED.journal_ref,
-                        license   = EXCLUDED.license,
-                        url       = EXCLUDED.url,
-                        s2_id     = EXCLUDED.s2_id,
-                        non_arxiv_citation_count  = EXCLUDED.non_arxiv_citation_count,
-                        non_arxiv_reference_count = EXCLUDED.non_arxiv_reference_count,
-                        related_arxiv_ids = EXCLUDED.related_arxiv_ids,
-                        tsne      = EXCLUDED.tsne;
-                """, row)
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            skipped += 1
+    try:
+        with conn.cursor() as cur:
+            for row in rows:
+                cur.execute("SAVEPOINT row_sp")
+                try:
+                    cur.execute(f"""
+                        INSERT INTO paper ({cols}) VALUES ({placeholders})
+                        ON CONFLICT (entry_id) DO UPDATE SET {_PAPER_UPSERT_SET};
+                    """, row)
+                    cur.execute("RELEASE SAVEPOINT row_sp")
+                except Exception:
+                    cur.execute("ROLLBACK TO SAVEPOINT row_sp")
+                    skipped += 1
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     if skipped:
         print(f"[warn] Skipped {skipped} papers due to constraint violations.")
 
@@ -237,6 +263,7 @@ def flush_embeddings(conn, rows: list[tuple]):
     """Bulk-insert embeddings via temp table + ON CONFLICT."""
     if not rows:
         return
+    rows = list({row[0]: row for row in rows}.values())   # one row per paper
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -261,18 +288,24 @@ def flush_embeddings(conn, rows: list[tuple]):
         conn.rollback()
         print(f"[warn] Bulk embedding insert failed ({e}), falling back to row-by-row...")
         skipped = 0
-        for row in rows:
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        INSERT INTO embedding (belonging_paper_entry_id, content)
-                        VALUES (%s, %s::vector)
-                        ON CONFLICT (belonging_paper_entry_id) DO UPDATE SET content = EXCLUDED.content;
-                    """, row)
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                skipped += 1
+        try:
+            with conn.cursor() as cur:
+                for row in rows:
+                    cur.execute("SAVEPOINT row_sp")
+                    try:
+                        cur.execute("""
+                            INSERT INTO embedding (belonging_paper_entry_id, content)
+                            VALUES (%s, %s::vector)
+                            ON CONFLICT (belonging_paper_entry_id) DO UPDATE SET content = EXCLUDED.content;
+                        """, row)
+                        cur.execute("RELEASE SAVEPOINT row_sp")
+                    except Exception:
+                        cur.execute("ROLLBACK TO SAVEPOINT row_sp")
+                        skipped += 1
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         if skipped:
             print(f"[warn] Skipped {skipped} embeddings due to errors.")
 
@@ -281,25 +314,130 @@ def flush_links(conn, table: str, cols: list[str], rows: list[tuple]):
     """Bulk-insert citation/reference links via temp table + ON CONFLICT."""
     if not rows:
         return
+    try:
+        with conn.cursor() as cur:
+            tmp = f"_tmp_{table}"
+            cur.execute(f"""
+                CREATE TEMP TABLE {tmp} (
+                    {cols[0]} TEXT NOT NULL,
+                    {cols[1]} TEXT NOT NULL
+                ) ON COMMIT DROP;
+            """)
+            buf = io.StringIO()
+            for row in rows:
+                buf.write(f"{escape_copy(row[0])}\t{escape_copy(row[1])}\n")
+            buf.seek(0)
+            cur.copy_from(buf, tmp, columns=cols)
+            col_list = ", ".join(cols)
+            cur.execute(f"""
+                INSERT INTO {table} ({col_list})
+                SELECT {col_list} FROM {tmp}
+                ON CONFLICT DO NOTHING;
+            """)
+        conn.commit()
+    except Exception:
+        # leave the connection usable; the import stops and resumes from the last checkpoint
+        conn.rollback()
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Import state (app_state table, created by the Prisma migrations)
+# ---------------------------------------------------------------------------
+
+DATASET_IMPORT_KEY = "dataset_import"          # same keys as Database/db.py
+DATASET_IMPORT_COMPLETE = "complete"
+DATASET_IMPORT_OFFSET_KEY = "dataset_import_offset"
+
+
+def _has_app_state(conn) -> bool:
     with conn.cursor() as cur:
-        tmp = f"_tmp_{table}"
-        cur.execute(f"""
-            CREATE TEMP TABLE {tmp} (
-                {cols[0]} TEXT NOT NULL,
-                {cols[1]} TEXT NOT NULL
-            ) ON COMMIT DROP;
+        cur.execute("SELECT to_regclass('app_state') IS NOT NULL")
+        ok = cur.fetchone()[0]
+    conn.commit()
+    return bool(ok)
+
+
+def get_state(conn, key: str) -> str | None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT value FROM app_state WHERE key = %s", (key,))
+        row = cur.fetchone()
+    conn.commit()
+    return row[0] if row else None
+
+
+def set_state(conn, key: str, value: str):
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO app_state (key, value, updated_at) VALUES (%s, %s, now())
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+        """, (key, value))
+    conn.commit()
+
+
+def _load_checkpoint(conn, filepath: str, file_size: int) -> tuple[int, int]:
+    """(byte offset, line number) to resume from; (0, 0) if none or for another file."""
+    raw = get_state(conn, DATASET_IMPORT_OFFSET_KEY)
+    if not raw:
+        return 0, 0
+    try:
+        cp = json.loads(raw)
+    except ValueError:
+        return 0, 0
+    if cp.get("file") != os.path.basename(filepath) or cp.get("size") != file_size:
+        print("[resume] Stored checkpoint belongs to a different file - starting from the beginning.")
+        return 0, 0
+    return int(cp.get("offset", 0)), int(cp.get("line", 0))
+
+
+def _save_checkpoint(conn, filepath: str, file_size: int, offset: int, line_no: int):
+    set_state(conn, DATASET_IMPORT_OFFSET_KEY, json.dumps({
+        "file": os.path.basename(filepath), "size": file_size, "offset": offset, "line": line_no,
+    }))
+
+
+def refresh_derived_columns(conn):
+    """
+    Fills category_list / primary_category / arxiv_citation_count for all
+    papers (same logic as the Prisma migration category_list_and_citation_count).
+    Run once after the bulk import – one pass is much cheaper than keeping the
+    columns up to date row by row while importing millions of papers.
+    Skipped if the columns don't exist (schema not migrated by Prisma).
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT count(*) FROM information_schema.columns
+             WHERE table_name = 'paper'
+               AND column_name IN ('category_list', 'primary_category', 'arxiv_citation_count')
         """)
-        buf = io.StringIO()
-        for row in rows:
-            buf.write(f"{escape_copy(row[0])}\t{escape_copy(row[1])}\n")
-        buf.seek(0)
-        cur.copy_from(buf, tmp, columns=cols)
-        col_list = ", ".join(cols)
-        cur.execute(f"""
-            INSERT INTO {table} ({col_list})
-            SELECT {col_list} FROM {tmp}
-            ON CONFLICT DO NOTHING;
+        if cur.fetchone()[0] < 3:
+            print("[warn] Derived columns missing (run `prisma migrate deploy` first) – skipping refresh.")
+            return
+        print("[derive] Updating category_list / primary_category / arxiv_citation_count ...")
+        t0 = time.time()
+        cur.execute("""
+            WITH cc AS (
+                SELECT belonging_paper_entry_id AS entry_id, COUNT(*)::int AS cnt
+                  FROM paper_citation
+                 GROUP BY belonging_paper_entry_id
+            ),
+            src AS (
+                SELECT p.id,
+                       NULLIF(btrim(regexp_replace(COALESCE(p.categories, ''), '[\\s,]+', ' ', 'g')), '') AS cats,
+                       COALESCE(cc.cnt, 0) AS cnt
+                  FROM paper p
+                  LEFT JOIN cc ON cc.entry_id = p.entry_id
+            )
+            UPDATE paper p
+               SET category_list        = CASE WHEN src.cats IS NULL THEN ARRAY[]::TEXT[]
+                                               ELSE string_to_array(src.cats, ' ') END,
+                   primary_category     = CASE WHEN src.cats IS NULL THEN NULL
+                                               ELSE split_part(src.cats, ' ', 1) END,
+                   arxiv_citation_count = src.cnt
+              FROM src
+             WHERE src.id = p.id
         """)
+        print(f"[derive] {cur.rowcount:,} papers updated in {time.time() - t0:.1f}s")
     conn.commit()
 
 
@@ -307,10 +445,67 @@ def flush_links(conn, table: str, cols: list[str], rows: list[tuple]):
 # Main import loop
 # ---------------------------------------------------------------------------
 
+def parse_record(rec: dict):
+    """
+    Converts one JSONL record into (paper_row, embedding_row | None,
+    citation_ids, reference_ids), or None if the record has no id.
+    Robust against null / non-string values (e.g. "title": null, numeric ids).
+    """
+    # Support both old ("id") and new ("entry_id") field name
+    entry_id = str(rec.get("entry_id") or rec.get("id") or "").strip()
+    if not entry_id:
+        return None
+
+    title = str(rec.get("title") or "").strip()
+
+    # Related arXiv IDs (from Semantic Scholar)
+    related_arxiv_ids = rec.get("related_arxiv_ids")
+    related_arxiv_json = json.dumps(related_arxiv_ids) if isinstance(related_arxiv_ids, list) and related_arxiv_ids else None
+
+    # Build tsne JSON from tsne_x / tsne_y if present
+    tsne_x = rec.get("tsne_x")
+    tsne_y = rec.get("tsne_y")
+    tsne_json = None
+    if tsne_x is not None and tsne_y is not None:
+        tsne_json = json.dumps({"x": tsne_x, "y": tsne_y, "method": "umap"})
+
+    paper_row = (
+        entry_id, title, rec.get("authors"), rec.get("abstract"), rec.get("categories"),
+        parse_dt(rec.get("published")), parse_dt(rec.get("updated")),
+        rec.get("doi"), rec.get("journal_ref"), rec.get("license"), rec.get("url"),
+        rec.get("s2_id") or None,
+        rec.get("non_arxiv_citation_count"), rec.get("non_arxiv_reference_count"),
+        related_arxiv_json, tsne_json,
+    )
+
+    # Embedding (128-D vector)
+    embedding_vec = rec.get("embedding")
+    embedding_row = None
+    if embedding_vec and isinstance(embedding_vec, list):
+        embedding_row = (entry_id, json.dumps(embedding_vec))
+
+    citations = [c for c in (str(x).strip() for x in (rec.get("citations") or []) if x is not None) if c]
+    references = [r for r in (str(x).strip() for x in (rec.get("references") or []) if x is not None) if r]
+    return paper_row, embedding_row, citations, references
+
+
 def import_dataset(filepath: str, batch_size: int = 20000):
+    """
+    Streams the JSONL file into Postgres. Every ``batch_size`` papers all
+    buffers are flushed and the byte offset is stored in app_state, so an
+    interrupted import continues at the last checkpoint instead of starting
+    over (re-imported rows are idempotent upserts). At the end the
+    ``dataset_import=complete`` marker is set, so the app does not download
+    and import the dataset again on its next start.
+    """
     conn = get_connection()
     print(f"[db] Connected to {conn.dsn}")
     ensure_tables(conn)
+
+    use_state = _has_app_state(conn)
+    if not use_state:
+        print("[warn] app_state table missing (run `prisma migrate deploy`) - import is not resumable "
+              "and will not be marked complete.")
 
     paper_batch: list[tuple] = []
     embedding_batch: list[tuple] = []
@@ -323,96 +518,70 @@ def import_dataset(filepath: str, batch_size: int = 20000):
     total_references = 0
     t0 = time.time()
 
-    # Get total file size for progress bar (rough estimate)
     file_size = os.path.getsize(filepath)
+    offset, line_no = _load_checkpoint(conn, filepath, file_size) if use_state else (0, 0)
+    if offset:
+        print(f"[resume] Continuing import at line {line_no + 1:,} (byte {offset:,} of {file_size:,})")
 
-    with open(filepath, "r", encoding="utf-8") as fh:
-        # Use tqdm for progress bar
+    def flush_all():
+        flush_papers(conn, paper_batch)
+        paper_batch.clear()
+        flush_embeddings(conn, embedding_batch)
+        embedding_batch.clear()
+        flush_links(conn, "paper_citation", PAPER_CITATION_COLS, citation_batch)
+        citation_batch.clear()
+        flush_links(conn, "paper_reference", PAPER_REFERENCE_COLS, reference_batch)
+        reference_batch.clear()
+
+    # Binary mode: the byte offset of every line is known exactly (text-mode
+    # tell() is not usable while iterating), so the checkpoint can seek().
+    with open(filepath, "rb") as fh:
+        fh.seek(offset)
         pbar = tqdm(fh, total=None, unit="papers", mininterval=1.0, desc="Importing")
-        
-        for line_no, line in enumerate(pbar, start=1):
-            line = line.strip()
+
+        for raw in pbar:
+            offset += len(raw)
+            line_no += 1
+            line = raw.strip()
             if not line:
                 continue
 
             try:
                 rec = json.loads(line)
-            except json.JSONDecodeError as e:
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
                 print(f"[warn] Skipping line {line_no}: {e}")
                 continue
-
-            # Support both old ("id") and new ("entry_id") field name
-            entry_id = (rec.get("entry_id") or rec.get("id", "")).strip()
-            if not entry_id:
+            if not isinstance(rec, dict):
+                print(f"[warn] Skipping line {line_no}: not a JSON object")
                 continue
 
-            title = rec.get("title", "").strip()
-            authors = rec.get("authors", None)
-            abstract = rec.get("abstract", None)
-            published = parse_dt(rec.get("published"))
-            updated = parse_dt(rec.get("updated"))
-            categories = rec.get("categories", None)
-            doi = rec.get("doi", None)
-            journal_ref = rec.get("journal_ref", None)
-            license_val = rec.get("license", None)
-            url = rec.get("url", None)
-            s2_id = rec.get("s2_id", None)
-            non_arxiv_cit = rec.get("non_arxiv_citation_count", None)
-            non_arxiv_ref = rec.get("non_arxiv_reference_count", None)
+            parsed = parse_record(rec)
+            if parsed is None:
+                continue
+            paper_row, embedding_row, citations, references = parsed
+            entry_id = paper_row[0]
 
-            # Related arXiv IDs (from Semantic Scholar)
-            related_arxiv_ids = rec.get("related_arxiv_ids", None)
-            related_arxiv_json = None
-            if related_arxiv_ids and isinstance(related_arxiv_ids, list):
-                related_arxiv_json = json.dumps(related_arxiv_ids)
-
-            # Build tsne JSON from tsne_x / tsne_y if present
-            tsne_x = rec.get("tsne_x")
-            tsne_y = rec.get("tsne_y")
-            tsne_json = None
-            if tsne_x is not None and tsne_y is not None:
-                tsne_json = json.dumps({"x": tsne_x, "y": tsne_y, "method": "umap"})
-
-            paper_row = (
-                entry_id, title, authors, abstract, categories,
-                published, updated, doi, journal_ref,
-                license_val, url, s2_id, non_arxiv_cit, non_arxiv_ref,
-                related_arxiv_json, tsne_json,
-            )
             paper_batch.append(paper_row)
             total_papers += 1
-
-            # Embedding (128-D vector)
-            embedding_vec = rec.get("embedding")
-            if embedding_vec and isinstance(embedding_vec, list) and len(embedding_vec) > 0:
-                embedding_batch.append((entry_id, json.dumps(embedding_vec)))
+            if embedding_row is not None:
+                embedding_batch.append(embedding_row)
                 total_embeddings += 1
-
             # Citations (arXiv IDs this paper is cited by)
-            for cit_id in (rec.get("citations") or []):
-                cit_id = str(cit_id).strip()
-                if cit_id:
-                    citation_batch.append((entry_id, cit_id))
-                    total_citations += 1
-
+            for cit_id in citations:
+                citation_batch.append((entry_id, cit_id))
+            total_citations += len(citations)
             # References (arXiv IDs this paper references)
-            for ref_id in (rec.get("references") or []):
-                ref_id = str(ref_id).strip()
-                if ref_id:
-                    reference_batch.append((entry_id, ref_id))
-                    total_references += 1
+            for ref_id in references:
+                reference_batch.append((entry_id, ref_id))
+            total_references += len(references)
 
-            # Flush papers
+            # Checkpoint: flush everything, then remember where we are
             if len(paper_batch) >= batch_size:
-                flush_papers(conn, paper_batch)
-                paper_batch.clear()
+                flush_all()
+                if use_state:
+                    _save_checkpoint(conn, filepath, file_size, offset, line_no)
 
-            # Flush embeddings
-            if len(embedding_batch) >= batch_size:
-                flush_embeddings(conn, embedding_batch)
-                embedding_batch.clear()
-
-            # Flush links
+            # Link buffers can grow much faster than the paper buffer
             if len(citation_batch) >= batch_size * 5:
                 flush_links(conn, "paper_citation", PAPER_CITATION_COLS, citation_batch)
                 citation_batch.clear()
@@ -430,10 +599,15 @@ def import_dataset(filepath: str, batch_size: int = 20000):
                 })
 
     # Flush remaining
-    flush_papers(conn, paper_batch)
-    flush_embeddings(conn, embedding_batch)
-    flush_links(conn, "paper_citation", PAPER_CITATION_COLS, citation_batch)
-    flush_links(conn, "paper_reference", PAPER_REFERENCE_COLS, reference_batch)
+    flush_all()
+    if use_state:
+        _save_checkpoint(conn, filepath, file_size, offset, line_no)
+
+    refresh_derived_columns(conn)
+
+    if use_state:
+        set_state(conn, DATASET_IMPORT_KEY, DATASET_IMPORT_COMPLETE)
+        set_state(conn, DATASET_IMPORT_OFFSET_KEY, "")
 
     elapsed = time.time() - t0
     print(

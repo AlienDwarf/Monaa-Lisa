@@ -5,7 +5,7 @@ New flow:
     1. First run -> download dataset + models from Google Drive -> import into DB
     2. Every run  -> ensure pre-trained models (PCA + UMAP) are present
     3. Load the EmbeddingPipeline (768 ->128 ->2D)
-    4. Run an immediate incremental update (arXiv gap-fill)
+    4. Run an immediate incremental update (arXiv OAI-PMH harvest since last run)
     5. Schedule monthly incremental updates and bi-weekly uncaught-paper retries
     6. Wait for shutdown signal
 """
@@ -15,17 +15,24 @@ import sys
 import signal
 import faulthandler
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 
 from config import cfg
-from util.logger import Logger
-from Database.db import is_database_empty, engine
-from Database.db_models import db_base
+from util.logger import Logger, capture_library_logger
+from Database.db import (
+    DATASET_IMPORT_COMPLETE,
+    DATASET_IMPORT_KEY,
+    engine,
+    get_app_state,
+    is_database_empty,
+    is_dataset_import_complete,
+    set_app_state,
+)
 from SemanticPaper.api.semantic_scholar import SemanticScholarAPI
-from SemanticPaper.api.arxiv import ArxivAPI
+from SemanticPaper.api.arxiv_oai import ArxivOAIClient
 from SemanticPaper.data.downloader import (
     ensure_all_downloaded,
     ensure_models_exist,
@@ -35,11 +42,35 @@ from SemanticPaper.data.downloader import (
 from SemanticPaper.data.importer import run_import
 from SemanticPaper.pipeline.embedding_pipeline import EmbeddingPipeline
 from SemanticPaper.pipeline.incremental import (
+    UNCAUGHT_RETRY_LAST_RUN,
     run_incremental_update,
     retry_uncaught_papers,
 )
 
 logger = Logger("Main")
+# APScheduler logs job exceptions on its own logger - route them to console + logs/apscheduler.log
+capture_library_logger("apscheduler")
+
+
+def _next_uncaught_retry(interval_days: int) -> datetime:
+    """
+    The scheduler is in-memory: a plain interval job would first run
+    ``interval_days`` after every restart, i.e. practically never on a host
+    that restarts more often. The last successful run is stored in app_state
+    instead; an overdue (or never run) retry starts right away.
+    """
+    now = datetime.now()
+    try:
+        last = get_app_state(UNCAUGHT_RETRY_LAST_RUN)
+        last_run = datetime.fromisoformat(last) if last else None
+    except Exception as e:
+        logger.warning(f"Could not read last uncaught retry run ({e}) - running it now")
+        last_run = None
+    if last_run is None:
+        return now
+    if last_run.tzinfo is not None:
+        last_run = last_run.astimezone().replace(tzinfo=None)   # local naive, like datetime.now()
+    return max(now, last_run + timedelta(days=interval_days))
 
 load_dotenv()
 
@@ -73,10 +104,24 @@ def main():
         sys.exit(1)
 
     # ---- 2. First-run: download & import ----
-    first_run = is_database_empty()
-    if first_run:
-        logger.info("First run detected – database is empty.")
-        logger.info("Downloading dataset and pre-trained models from Google Drive...")
+    # Maßgeblich ist der gespeicherte Import-Status, nicht "Tabelle nicht leer":
+    # Ein abgebrochener Import wird so beim nächsten Start fortgesetzt
+    # (der Import ist idempotent – vorhandene Zeilen werden per Upsert überschrieben).
+    # Ein Fehler bei der Prüfung beendet das Programm, statt fälschlich
+    # einen kompletten Neu-Import auszulösen.
+    try:
+        import_complete = is_dataset_import_complete()
+        db_empty = is_database_empty()
+    except Exception as e:
+        logger.error(f"Could not determine import state (did Prisma migrations run?): {e}")
+        sys.exit(1)
+
+    if not import_complete:
+        if db_empty:
+            logger.info("First run detected – database is empty.")
+        else:
+            logger.warning("Previous dataset import did not finish – resuming import.")
+        logger.info("Downloading dataset and pre-trained models...")
 
         if not ensure_all_downloaded():
             logger.error("Failed to download required files. Exiting.")
@@ -90,6 +135,7 @@ def main():
             logger.error("Dataset import failed. Exiting.")
             sys.exit(1)
 
+        set_app_state(DATASET_IMPORT_KEY, DATASET_IMPORT_COMPLETE)
         logger.info("Dataset imported successfully. Cleaning up raw file...")
         cleanup_dataset()
     else:
@@ -111,7 +157,10 @@ def main():
     # ---- 4. Initialise API clients ----
     api_key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "")
     s2_client = SemanticScholarAPI(api_key if api_key else None)
-    arxiv_client = ArxivAPI()
+    # arXiv OAI-PMH (offizielle Schnittstelle für Massen-/Inkrementell-Abgleich)
+    oai_client = ArxivOAIClient(
+        delay_seconds=cfg.get_float("semanticpaper", "oai_delay_seconds", 3.0),
+    )
 
     # ---- 5. Schedule periodic tasks ----
     update_interval_days = cfg.get_int(
@@ -131,22 +180,30 @@ def main():
         "interval",
         days=update_interval_days,
         next_run_time=datetime.now(),
-        args=[arxiv_client, s2_client, pipeline],
+        args=[oai_client, s2_client, pipeline],
         id="incremental_update",
         max_instances=1,
     )
     logger.info(f"Scheduled incremental update: every {update_interval_days} days")
 
-    # Uncaught paper retry
+    # Uncaught paper retry (shares a lock with the incremental update, so it
+    # waits instead of hitting SemanticScholar at the same time)
+    retry_first_run = _next_uncaught_retry(uncaught_interval_days)
     scheduler.add_job(
         retry_uncaught_papers,
         "interval",
         days=uncaught_interval_days,
+        next_run_time=retry_first_run,
         args=[s2_client, pipeline],
         id="uncaught_retry",
         max_instances=1,
+        coalesce=True,
+        misfire_grace_time=None,
     )
-    logger.info(f"Scheduled uncaught paper retry: every {uncaught_interval_days} days")
+    logger.info(
+        f"Scheduled uncaught paper retry: every {uncaught_interval_days} days "
+        f"(next run {retry_first_run:%Y-%m-%d %H:%M})"
+    )
 
     scheduler.start()
     logger.info("Scheduler started. System is running.")

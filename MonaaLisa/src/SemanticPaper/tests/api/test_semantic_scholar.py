@@ -1,16 +1,14 @@
 import pytest
 from unittest.mock import Mock, patch
 
-from MonaaLisa.src.SemanticPaper.api.semantic_scholar import SemanticScholarAPI
+from MonaaLisa.src.SemanticPaper.api.semantic_scholar import RateLimiter, SemanticScholarAPI
 
 
 @pytest.fixture
 def semantic_scholar_api():
     """Creates a SemanticScholarAPI instance with mocked external dependencies."""
-    with patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.AsyncSemanticScholar'), \
-         patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.Logger'):
-        api = SemanticScholarAPI(api_key="test_key")
-        api.client = Mock()
+    with patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.Logger'):
+        api = SemanticScholarAPI(api_key="test_key", rate_limiter=RateLimiter(0))
         api.logger = Mock()
         return api
 
@@ -18,244 +16,10 @@ def semantic_scholar_api():
 @pytest.fixture
 def semantic_scholar_api_no_key():
     """Creates a SemanticScholarAPI instance without API key."""
-    with patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.AsyncSemanticScholar'), \
-         patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.Logger'):
-        api = SemanticScholarAPI(api_key=None)
-        api.client = Mock()
+    with patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.Logger'):
+        api = SemanticScholarAPI(api_key=None, rate_limiter=RateLimiter(0))
         api.logger = Mock()
         return api
-
-
-class TestFetchCitations:
-    """Tests conditional logic in fetch_citations()."""
-
-    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.asyncio.run')
-    def test_handles_paper_with_arxiv_citations(self, mock_asyncio_run, semantic_scholar_api):
-        """
-        Tests: if arxiv_id: branch in the citation loop
-
-        When a citation has an ArXiv ID, it should be added to citation_arxiv_ids.
-        """
-        mock_paper = Mock()
-        mock_paper.entry_id = "http://arxiv.org/abs/2101.12345v1"
-
-        # Mock citation with ArXiv ID
-        mock_citation = Mock()
-        mock_citation.externalIds = {"ArXiv": "2101.54321"}
-
-        # Mock the async function return value
-        mock_semantic_paper = Mock()
-        mock_semantic_paper.citations = [mock_citation]
-        # Since fetch_citations calls asyncio.run on a function that returns the citations,
-        # we need to mock that return value
-        mock_asyncio_run.return_value = [mock_citation]
-
-        # Since we establish that the citation has an ArXiv ID, we expect the code
-        # to call fetch_papers_by_ids on the Arxiv client with that ID.
-        # We need to mock that as well to return a valid paper object.
-
-        # Mock ArxivAPI
-        mock_arxiv_client = Mock()
-        mock_arxiv_client.fetch_papers_by_ids.return_value = [Mock()]
-
-        citations_on_arxiv, citations_not_present = semantic_scholar_api.fetch_citations(
-            mock_paper, mock_arxiv_client
-        )
-
-        # Verify ArXiv client was called with the correct ID
-        mock_arxiv_client.fetch_papers_by_ids.assert_called_once()
-        assert len(citations_on_arxiv) == 1
-        assert len(citations_not_present) == 0
-
-    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.asyncio.run')
-    def test_handles_citations_without_arxiv_id(self, mock_asyncio_run, semantic_scholar_api):
-        """
-        Tests: else branch when citation has no ArXiv ID
-
-        Citations without ArXiv IDs should be added to citations_not_present.
-        """
-        mock_paper = Mock()
-        mock_paper.entry_id = "http://arxiv.org/abs/2101.12345v1"
-
-        # Mock citation without ArXiv ID
-        mock_citation = Mock()
-        mock_citation.externalIds = {"DOI": "10.1234/example"}
-
-        mock_asyncio_run.return_value = [mock_citation]
-
-        mock_arxiv_client = Mock()
-
-        # Same as before, we need to mock the Arxiv client,
-        # but in this case we expect it not to be called since there were no ArXiv IDs.
-
-        citations_on_arxiv, citations_not_present = semantic_scholar_api.fetch_citations(
-            mock_paper, mock_arxiv_client
-        )
-
-        # Verify no ArXiv fetch was attempted
-        mock_arxiv_client.fetch_papers_by_ids.assert_not_called()
-        assert len(citations_on_arxiv) == 0
-        assert len(citations_not_present) == 1
-
-    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.asyncio.run')
-    def test_handles_empty_citations_list(self, mock_asyncio_run, semantic_scholar_api):
-        """
-        Tests: if citation_arxiv_ids: branch when list is empty
-
-        When there are no citations with ArXiv IDs, citations_on_arxiv should be empty list.
-        """
-        mock_paper = Mock()
-        mock_paper.entry_id = "http://arxiv.org/abs/2101.12345v1"
-
-        mock_asyncio_run.return_value = []
-
-        mock_arxiv_client = Mock()
-
-        citations_on_arxiv, citations_not_present = semantic_scholar_api.fetch_citations(
-            mock_paper, mock_arxiv_client
-        )
-
-        assert citations_on_arxiv == []
-        assert citations_not_present == []
-
-    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.asyncio.run')
-    def test_handles_mixed_citations(self, mock_asyncio_run, semantic_scholar_api):
-        """
-        Tests: Mixed case with both ArXiv and non-ArXiv citations
-
-        Verifies proper separation between citations_on_arxiv and citations_not_present.
-        """
-        mock_paper = Mock()
-        mock_paper.entry_id = "http://arxiv.org/abs/2101.12345v1"
-
-        # Mock citation with ArXiv ID
-        mock_citation_arxiv = Mock()
-        mock_citation_arxiv.externalIds = {"ArXiv": "2101.54321"}
-
-        # Mock citation without ArXiv ID
-        mock_citation_no_arxiv = Mock()
-        mock_citation_no_arxiv.externalIds = {"DOI": "10.1234/example"}
-
-        mock_asyncio_run.return_value = [mock_citation_arxiv, mock_citation_no_arxiv]
-
-        mock_arxiv_client = Mock()
-        mock_arxiv_client.fetch_papers_by_ids.return_value = [Mock()]
-
-        citations_on_arxiv, citations_not_present = semantic_scholar_api.fetch_citations(
-            mock_paper, mock_arxiv_client
-        )
-        # Verify ArXiv client was called once for the one citation with an ArXiv ID
-        assert len(citations_on_arxiv) == 1
-        assert len(citations_not_present) == 1
-
-
-class TestFetchReferences:
-    """Tests conditional logic in fetch_references()."""
-    # Annotation: Extremely similar to the citation tests, but we want to keep them separate for clarity and to ensure we cover the specific logic in references.
-
-    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.asyncio.run')
-    def test_handles_paper_with_arxiv_references(self, mock_asyncio_run, semantic_scholar_api):
-        """
-        Tests: if arxiv_id: branch in the reference loop
-
-        When a reference has an ArXiv ID, it should be added to references_arxiv_ids.
-        """
-        mock_paper = Mock()
-        mock_paper.entry_id = "http://arxiv.org/abs/2101.12345v1"
-
-        # Mock reference with ArXiv ID
-        mock_reference = Mock()
-        mock_reference.externalIds = {"ArXiv": "2101.54321"}
-
-        mock_asyncio_run.return_value = [mock_reference]
-
-        mock_arxiv_client = Mock()
-        mock_arxiv_client.fetch_papers_by_ids.return_value = [Mock()]
-
-        references_on_arxiv, references_not_present = semantic_scholar_api.fetch_references(
-            mock_paper, mock_arxiv_client
-        )
-
-        mock_arxiv_client.fetch_papers_by_ids.assert_called_once()
-        assert len(references_on_arxiv) == 1
-        assert len(references_not_present) == 0
-
-    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.asyncio.run')
-    def test_handles_references_without_arxiv_id(self, mock_asyncio_run, semantic_scholar_api):
-        """
-        Tests: else branch when reference has no ArXiv ID
-
-        References without ArXiv IDs should be added to references_not_present.
-        """
-        mock_paper = Mock()
-        mock_paper.entry_id = "http://arxiv.org/abs/2101.12345v1"
-
-        # Mock reference without ArXiv ID
-        mock_reference = Mock()
-        mock_reference.externalIds = {"DOI": "10.1234/example"}
-
-        mock_asyncio_run.return_value = [mock_reference]
-
-        mock_arxiv_client = Mock()
-
-        references_on_arxiv, references_not_present = semantic_scholar_api.fetch_references(
-            mock_paper, mock_arxiv_client
-        )
-
-        mock_arxiv_client.fetch_papers_by_ids.assert_not_called()
-        assert len(references_on_arxiv) == 0
-        assert len(references_not_present) == 1
-
-    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.asyncio.run')
-    def test_handles_empty_references_list(self, mock_asyncio_run, semantic_scholar_api):
-        """
-        Tests: if references_arxiv_ids: branch when list is empty
-
-        When there are no references with ArXiv IDs, references_on_arxiv should be empty list.
-        """
-        mock_paper = Mock()
-        mock_paper.entry_id = "http://arxiv.org/abs/2101.12345v1"
-
-        mock_asyncio_run.return_value = []
-
-        mock_arxiv_client = Mock()
-
-        references_on_arxiv, references_not_present = semantic_scholar_api.fetch_references(
-            mock_paper, mock_arxiv_client
-        )
-
-        assert references_on_arxiv == []
-        assert references_not_present == []
-
-    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.asyncio.run')
-    def test_handles_mixed_references(self, mock_asyncio_run, semantic_scholar_api):
-        """
-        Tests: Mixed case with both ArXiv and non-ArXiv references
-
-        Verifies proper separation between references_on_arxiv and references_not_present.
-        """
-        mock_paper = Mock()
-        mock_paper.entry_id = "http://arxiv.org/abs/2101.12345v1"
-
-        # Mock reference with ArXiv ID
-        mock_reference_arxiv = Mock()
-        mock_reference_arxiv.externalIds = {"ArXiv": "2101.54321"}
-
-        # Mock reference without ArXiv ID
-        mock_reference_no_arxiv = Mock()
-        mock_reference_no_arxiv.externalIds = {"DOI": "10.1234/example"}
-
-        mock_asyncio_run.return_value = [mock_reference_arxiv, mock_reference_no_arxiv]
-
-        mock_arxiv_client = Mock()
-        mock_arxiv_client.fetch_papers_by_ids.return_value = [Mock()]
-
-        references_on_arxiv, references_not_present = semantic_scholar_api.fetch_references(
-            mock_paper, mock_arxiv_client
-        )
-
-        assert len(references_on_arxiv) == 1
-        assert len(references_not_present) == 1
 
 
 class TestFetchBatch:
@@ -592,9 +356,11 @@ class TestFetchBatch:
         """
         Tests: batching logic with batch_size smaller than total IDs
 
-        When there are more IDs than batch_size, multiple requests should be made
-        and time.sleep should be called between batches.
+        When there are more IDs than batch_size, multiple requests should be made,
+        each paced by the rate limiter (pause_seconds is ignored).
         """
+        limiter = Mock()
+        semantic_scholar_api.rate_limiter = limiter
         mock_response_1 = Mock()
         mock_response_1.raise_for_status = Mock()
         mock_response_1.json.return_value = [
@@ -626,7 +392,8 @@ class TestFetchBatch:
         )
 
         assert mock_post.call_count == 2
-        mock_sleep.assert_called_once_with(0.5)
+        assert limiter.wait.call_count == 2
+        mock_sleep.assert_not_called()
         assert len(found) == 2
         assert len(not_found) == 0
 
@@ -704,3 +471,129 @@ class TestFetchBatch:
         assert len(not_found) == 1
         assert not_found[0] == "2101.12345"
 
+
+
+def _resp(status, body=None, headers=None):
+    r = Mock()
+    r.status_code = status
+    r.headers = headers or {}
+    r.json.return_value = body if body is not None else []
+    r.raise_for_status = Mock()
+    return r
+
+
+_FOUND_ITEM = {"paperId": "s2", "embedding": {"vector": [0.1] * 768}, "citations": [], "references": []}
+
+
+class TestFetchBatchDetailedRetries:
+    """Retry, splitting and failure handling in fetch_batch_detailed()."""
+
+    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.time.sleep')
+    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.requests.post')
+    def test_retries_on_429_and_honours_retry_after(self, mock_post, mock_sleep, semantic_scholar_api):
+        mock_post.side_effect = [_resp(429, headers={"Retry-After": "7"}), _resp(200, [_FOUND_ITEM])]
+
+        found, not_found, failed = semantic_scholar_api.fetch_batch_detailed(["2101.1"])
+
+        assert [f["arxiv_id"] for f in found] == ["2101.1"]
+        assert not_found == [] and failed == []
+        assert mock_post.call_count == 2
+        mock_sleep.assert_any_call(7.0)
+
+    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.time.sleep')
+    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.requests.post')
+    def test_transport_failures_go_to_failed_not_not_found(self, mock_post, mock_sleep, semantic_scholar_api):
+        mock_post.side_effect = Exception("timeout")
+
+        found, not_found, failed = semantic_scholar_api.fetch_batch_detailed(["2101.1", "2101.2"])
+
+        assert found == [] and not_found == []
+        assert failed == ["2101.1", "2101.2"]
+        assert mock_post.call_count == SemanticScholarAPI.MAX_ATTEMPTS
+
+    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.time.sleep')
+    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.requests.post')
+    def test_http_400_splits_batch(self, mock_post, mock_sleep, semantic_scholar_api):
+        def answer(url, json, params, headers, timeout):
+            ids = json["ids"]
+            if len(ids) > 1:
+                return _resp(400)
+            return _resp(200, [_FOUND_ITEM] if ids == ["ARXIV:2101.1"] else [None])
+        mock_post.side_effect = answer
+
+        found, not_found, failed = semantic_scholar_api.fetch_batch_detailed(["2101.1", "2101.2"])
+
+        assert [f["arxiv_id"] for f in found] == ["2101.1"]
+        assert not_found == ["2101.2"]
+        assert failed == []
+
+    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.time.sleep')
+    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.requests.post')
+    def test_fetch_batch_keeps_old_two_tuple_api(self, mock_post, mock_sleep, semantic_scholar_api):
+        mock_post.side_effect = Exception("down")
+
+        found, not_found = semantic_scholar_api.fetch_batch(["2101.1"])
+
+        assert found == [] and not_found == ["2101.1"]
+
+
+class TestRateLimiter:
+
+    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.time.sleep')
+    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.time.monotonic')
+    def test_spaces_requests(self, mock_mono, mock_sleep):
+        mock_mono.return_value = 100.0
+        limiter = RateLimiter(1.0)
+        limiter.wait()                 # first request: no wait
+        mock_sleep.assert_not_called()
+        mock_mono.return_value = 100.3
+        limiter.wait()                 # 0.3s later: must wait the remaining 0.7s
+        assert mock_sleep.call_args[0][0] == pytest.approx(0.7)
+
+    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.time.sleep')
+    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.time.monotonic', return_value=50.0)
+    def test_defer_pushes_next_slot(self, mock_mono, mock_sleep):
+        limiter = RateLimiter(1.0)
+        limiter.defer(30)
+        limiter.wait()
+        assert mock_sleep.call_args[0][0] == pytest.approx(30)
+
+    def test_clients_share_one_limiter_by_default(self):
+        with patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.Logger'):
+            assert SemanticScholarAPI("a").rate_limiter is SemanticScholarAPI(None).rate_limiter
+
+    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.time.sleep')
+    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.requests.post')
+    def test_long_retry_after_is_not_capped_at_60s(self, mock_post, mock_sleep, semantic_scholar_api):
+        mock_post.side_effect = [_resp(429, headers={"Retry-After": "300"}), _resp(200, [_FOUND_ITEM])]
+
+        found, _, _ = semantic_scholar_api.fetch_batch_detailed(["2101.1"])
+
+        assert len(found) == 1
+        mock_sleep.assert_any_call(300.0)
+
+
+class TestEmbeddingValidation:
+
+    @pytest.mark.parametrize("vector", [
+        [0.1] * 767,                    # wrong length
+        [0.1] * 769,
+        [0.1] * 767 + [None],           # null element
+        [0.1] * 767 + ["x"],            # non-numeric
+        [0.1] * 767 + [float("nan")],   # not finite
+        "not a list",
+        None,
+    ])
+    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.time.sleep')
+    @patch('MonaaLisa.src.SemanticPaper.api.semantic_scholar.requests.post')
+    def test_invalid_vectors_are_not_found(self, mock_post, mock_sleep, vector, semantic_scholar_api):
+        item = {"paperId": "s2", "embedding": {"vector": vector}, "citations": [], "references": []}
+        mock_post.return_value = _resp(200, [item])
+
+        found, not_found, failed = semantic_scholar_api.fetch_batch_detailed(["2101.1"])
+
+        assert found == [] and not_found == ["2101.1"] and failed == []
+
+    def test_valid_vector_with_ints_is_accepted(self):
+        item = {"paperId": "s2", "embedding": {"vector": [0] * 768}}
+        assert SemanticScholarAPI._parse_item("2101.1", item)["s2_id"] == "s2"

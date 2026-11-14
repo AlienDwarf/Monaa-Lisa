@@ -2,12 +2,30 @@ services:
   db:
     image: pgvector/pgvector:pg16
     restart: unless-stopped
+    # Docker-Standard sind 64 MB /dev/shm – zu wenig für parallele Scans und
+    # Hash-Joins über Millionen Zeilen ("could not resize shared memory segment")
+    shm_size: 1g
+    # Tuning für >2 Mio. Paper (Werte bei Bedarf an den RAM des Hosts anpassen)
+    command:
+      - postgres
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=2GB
+      - -c
+      - work_mem=32MB
+      - -c
+      - maintenance_work_mem=512MB
+      - -c
+      - max_wal_size=2GB
+      - -c
+      - random_page_cost=1.1
     environment:
       POSTGRES_USER: ${POSTGRES_USER-monaa}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD-sicherespasswort}
       POSTGRES_DB: ${POSTGRES_DB-monaa_lisa_db}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432" # nur lokal erreichbar, nicht im Netzwerk
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -21,6 +39,7 @@ services:
       context: .
       target: app
     image: monaa-lisa-app:latest
+    restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
@@ -37,7 +56,10 @@ services:
       - app_data:/app/data
     command: ["/bin/sh", "-c", "python MonaaLisa/src/Database/db.py && python MonaaLisa/src/main.py"]
 
-  backend:
+  # Läuft einmal vor dem Backend: Abhängigkeiten + DB-Migrationen.
+  # Getrennt vom Backend, weil große Migrationen (Millionen Zeilen) länger
+  # dauern können als der Healthcheck des Backends erlaubt.
+  migrate:
     image: node:20
     working_dir: /app
     depends_on:
@@ -46,23 +68,41 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      DATABASE_URL: postgresql://${POSTGRES_USER-monaa}:${POSTGRES_PASSWORD-sicherespasswort}@db:5432/${POSTGRES_DB-monaa_lisa_db}
+    volumes:
+      - ./MonaaLisa/src/Backend:/app
+      - backend_node_modules:/app/node_modules
+    command: ["sh", "-c", "npm install && npx prisma generate && npx prisma migrate deploy"]
+
+  backend:
+    image: node:20
+    working_dir: /app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER-monaa}:${POSTGRES_PASSWORD-sicherespasswort}@db:5432/${POSTGRES_DB-monaa_lisa_db}
       PORT: 3000
     volumes:
       - ./MonaaLisa/src/Backend:/app
       - backend_node_modules:/app/node_modules
-    command: ["sh", "-c", "npm install && npx prisma generate && npx prisma migrate deploy && npm run build && npm run start:prod"]
+    command: ["sh", "-c", "npm run build && npm run start:prod"]
     ports:
       - "3000:3000"
     stdin_open: true
     tty: true
     healthcheck:
-      # Prüft, ob der Server auf Port 3000 antwortet via wget
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000 || exit 1"]
+      # /health prüft auch die Datenbankverbindung
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
-      # WICHTIG: Gib ihm Zeit für npm install & migration, bevor der erste Check zählt
+      # Zeit für den Build, bevor der erste Check zählt (Migrationen laufen vorher im migrate-Service)
       start_period: 90s
 
 
@@ -70,6 +110,7 @@ services:
     build:
       context: ./MonaaLisa/src/Frontend
       dockerfile: Dockerfile
+    restart: unless-stopped
     ports:
       - "5173:5173"
     depends_on:
@@ -90,7 +131,7 @@ services:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER-monaa}:${POSTGRES_PASSWORD-sicherespasswort}@db:5432/${POSTGRES_DB-monaa_lisa_db}
     volumes:
       - ./MonaaLisa_dataset_full.jsonl:/app/MonaaLisa_dataset_full.jsonl:ro
       - ./import_dataset.py:/app/import_dataset.py:ro
