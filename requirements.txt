@@ -3,6 +3,8 @@ numpy==2.2.5
 joblib==1.5.3
 scikit-learn==1.8.0
 umap-learn==0.5.11
+# umap_model_2d.pkl was pickled with pynndescent 0.5.x; 0.7 cannot unpickle it
+pynndescent==0.5.13
 
 # Database
 psycopg2-binary==2.9.10
