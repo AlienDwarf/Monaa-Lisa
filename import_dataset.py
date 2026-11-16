@@ -20,12 +20,19 @@ Strategy:
     3. Batch-insert embeddings via COPY
     4. Collect citation / reference links and batch-insert via COPY
     5. Skip duplicates gracefully using a temp table + INSERT ... ON CONFLICT
+    6. category_list / primary_category / arxiv_citation_count are computed per
+       record, not by an UPDATE over the whole table afterwards
+    7. First import into an empty database: non-unique indexes are dropped
+       before and rebuilt once at the end (much faster than maintaining them
+       row by row); the definitions are kept in app_state until the rebuild
+       has finished, so an interrupted import still rebuilds them on resume
 """
 
 import argparse
 import io
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -146,6 +153,7 @@ PAPER_COLS = [
     "published", "updated", "doi", "journal_ref", "license",
     "url", "s2_id", "non_arxiv_citation_count", "non_arxiv_reference_count",
     "related_arxiv_ids", "tsne",
+    "category_list", "primary_category", "arxiv_citation_count",
 ]
 
 EMBEDDING_COLS = ["belonging_paper_entry_id", "content"]
@@ -168,9 +176,31 @@ _PAPER_UPSERT_SET = """
     non_arxiv_citation_count  = EXCLUDED.non_arxiv_citation_count,
     non_arxiv_reference_count = EXCLUDED.non_arxiv_reference_count,
     related_arxiv_ids = EXCLUDED.related_arxiv_ids,
-    tsne      = EXCLUDED.tsne
+    tsne      = EXCLUDED.tsne,
+    category_list    = EXCLUDED.category_list,
+    primary_category = EXCLUDED.primary_category,
+    arxiv_citation_count = EXCLUDED.arxiv_citation_count
 """
 _S2_IDX = PAPER_COLS.index("s2_id")
+
+_CATEGORY_SEP = re.compile(r"[\s,]+")
+
+
+def derive_categories(categories) -> tuple[list[str], str | None]:
+    """
+    (category_list, primary_category) from the categories string - same rule
+    as the migration category_list_and_citation_count and the backend's
+    deriveCategoryColumns: split on whitespace/commas, first one is primary.
+    """
+    if isinstance(categories, list):
+        categories = " ".join(str(c) for c in categories if c is not None)
+    cats = [c for c in _CATEGORY_SEP.split(str(categories or "")) if c]
+    return cats, (cats[0] if cats else None)
+
+
+def pg_text_array(values: list[str]) -> str:
+    """Postgres array literal for a TEXT[] column, e.g. {"cs.AI","cs.LG"}."""
+    return "{" + ",".join('"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"' for v in values) + "}"
 
 
 def _dedupe_papers(rows: list[tuple]) -> list[tuple]:
@@ -396,49 +426,154 @@ def _save_checkpoint(conn, filepath: str, file_size: int, offset: int, line_no: 
     }))
 
 
-def refresh_derived_columns(conn):
+def require_derived_columns(conn):
     """
-    Fills category_list / primary_category / arxiv_citation_count for all
-    papers (same logic as the Prisma migration category_list_and_citation_count).
-    Run once after the bulk import – one pass is much cheaper than keeping the
-    columns up to date row by row while importing millions of papers.
-    Skipped if the columns don't exist (schema not migrated by Prisma).
+    The paper rows carry category_list / primary_category /
+    arxiv_citation_count, which only exist after the Prisma migrations.
+    Fail early with a clear message instead of on the first COPY.
     """
     with conn.cursor() as cur:
         cur.execute("""
             SELECT count(*) FROM information_schema.columns
-             WHERE table_name = 'paper'
+             WHERE table_schema = current_schema() AND table_name = 'paper'
                AND column_name IN ('category_list', 'primary_category', 'arxiv_citation_count')
         """)
-        if cur.fetchone()[0] < 3:
-            print("[warn] Derived columns missing (run `prisma migrate deploy` first) – skipping refresh.")
-            return
-        print("[derive] Updating category_list / primary_category / arxiv_citation_count ...")
-        t0 = time.time()
+        ok = cur.fetchone()[0] == 3
+    conn.commit()
+    if not ok:
+        raise RuntimeError("paper.category_list / primary_category / arxiv_citation_count missing - "
+                           "run `prisma migrate deploy` before importing")
+
+
+def reconcile_citation_counts(conn):
+    """
+    arxiv_citation_count is set per record. A paper that appears in several
+    lines keeps only the last line's count, while paper_citation collects the
+    links of all of them - fix just those papers (stored count is never too
+    high, so only rows with links need checking).
+    """
+    print("[derive] Reconciling arxiv_citation_count with paper_citation ...")
+    t0 = time.time()
+    with conn.cursor() as cur:
         cur.execute("""
             WITH cc AS (
                 SELECT belonging_paper_entry_id AS entry_id, COUNT(*)::int AS cnt
                   FROM paper_citation
                  GROUP BY belonging_paper_entry_id
-            ),
-            src AS (
-                SELECT p.id,
-                       NULLIF(btrim(regexp_replace(COALESCE(p.categories, ''), '[\\s,]+', ' ', 'g')), '') AS cats,
-                       COALESCE(cc.cnt, 0) AS cnt
-                  FROM paper p
-                  LEFT JOIN cc ON cc.entry_id = p.entry_id
             )
             UPDATE paper p
-               SET category_list        = CASE WHEN src.cats IS NULL THEN ARRAY[]::TEXT[]
-                                               ELSE string_to_array(src.cats, ' ') END,
-                   primary_category     = CASE WHEN src.cats IS NULL THEN NULL
-                                               ELSE split_part(src.cats, ' ', 1) END,
-                   arxiv_citation_count = src.cnt
-              FROM src
-             WHERE src.id = p.id
+               SET arxiv_citation_count = cc.cnt
+              FROM cc
+             WHERE p.entry_id = cc.entry_id
+               AND p.arxiv_citation_count <> cc.cnt
         """)
-        print(f"[derive] {cur.rowcount:,} papers updated in {time.time() - t0:.1f}s")
+        print(f"[derive] {cur.rowcount:,} papers corrected in {time.time() - t0:.1f}s")
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Deferred indexes (first import into an empty database)
+# ---------------------------------------------------------------------------
+
+DEFERRED_INDEXES_KEY = "dataset_import_deferred_indexes"
+INDEXED_TABLES = ["paper", "embedding", "paper_citation", "paper_reference"]
+
+
+def _is_paper_table_empty(conn) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("SELECT NOT EXISTS (SELECT 1 FROM paper)")
+        empty = cur.fetchone()[0]
+    conn.commit()
+    return bool(empty)
+
+
+def _secondary_indexes(conn) -> list[dict]:
+    """
+    Non-unique indexes of the import tables. Primary keys and unique indexes
+    stay: ON CONFLICT (entry_id), the s2_id check and the link tables'
+    duplicate handling depend on them.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT ic.relname, pg_get_indexdef(x.indexrelid)
+              FROM pg_index x
+              JOIN pg_class ic ON ic.oid = x.indexrelid
+              JOIN pg_class t  ON t.oid  = x.indrelid
+              JOIN pg_namespace n ON n.oid = t.relnamespace
+             WHERE n.nspname = current_schema()
+               AND t.relname = ANY(%s)
+               AND NOT x.indisunique
+               AND NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = x.indexrelid)
+             ORDER BY t.relname, ic.relname
+        """, (INDEXED_TABLES,))
+        rows = cur.fetchall()
+    conn.commit()
+    return [{"name": name, "def": definition} for name, definition in rows]
+
+
+def defer_secondary_indexes(conn):
+    """
+    Stores the index definitions in app_state FIRST, then drops the indexes.
+    If the import dies at any point after this, the stored definitions make
+    the resumed import rebuild them (rebuild_secondary_indexes).
+    """
+    indexes = _secondary_indexes(conn)
+    if not indexes:
+        return
+    set_state(conn, DEFERRED_INDEXES_KEY, json.dumps(indexes))
+    with conn.cursor() as cur:
+        for idx in indexes:
+            cur.execute(f'DROP INDEX IF EXISTS "{idx["name"]}"')
+    conn.commit()
+    print(f"[index] Dropped {len(indexes)} secondary indexes for the import "
+          f"({', '.join(i['name'] for i in indexes)}); they are rebuilt at the end.")
+
+
+def rebuild_secondary_indexes(conn):
+    """
+    Recreates every index stored by defer_secondary_indexes (skipping ones
+    that already exist, e.g. after an interrupted rebuild), refreshes the
+    planner statistics and only then clears the stored definitions.
+    """
+    raw = get_state(conn, DEFERRED_INDEXES_KEY)
+    if not raw:
+        return
+    indexes = json.loads(raw)
+    print(f"[index] Rebuilding {len(indexes)} secondary indexes ...")
+    t_all = time.time()
+    with conn.cursor() as cur:
+        # Session-only: more memory and parallel workers for the index builds
+        cur.execute("SET maintenance_work_mem = '1GB'")
+        cur.execute("SET max_parallel_maintenance_workers = 4")
+    conn.commit()
+    for idx in indexes:
+        if _index_exists(conn, idx["name"]):
+            print(f"[index]   {idx['name']} already exists")
+            continue
+        t0 = time.time()
+        with conn.cursor() as cur:
+            cur.execute(idx["def"])
+        conn.commit()
+        print(f"[index]   {idx['name']} built in {time.time() - t0:.1f}s")
+
+    missing = [i["name"] for i in indexes if not _index_exists(conn, i["name"])]
+    if missing:
+        raise RuntimeError(f"Indexes missing after rebuild: {', '.join(missing)}")
+
+    with conn.cursor() as cur:
+        for table in INDEXED_TABLES:
+            cur.execute(f"ANALYZE {table}")
+    conn.commit()
+    set_state(conn, DEFERRED_INDEXES_KEY, "")
+    print(f"[index] All secondary indexes rebuilt in {time.time() - t_all:.1f}s")
+
+
+def _index_exists(conn, name: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s) IS NOT NULL", (f'"{name}"',))
+        exists = cur.fetchone()[0]
+    conn.commit()
+    return bool(exists)
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +604,11 @@ def parse_record(rec: dict):
     if tsne_x is not None and tsne_y is not None:
         tsne_json = json.dumps({"x": tsne_x, "y": tsne_y, "method": "umap"})
 
+    citations = [c for c in (str(x).strip() for x in (rec.get("citations") or []) if x is not None) if c]
+    references = [r for r in (str(x).strip() for x in (rec.get("references") or []) if x is not None) if r]
+
+    category_list, primary_category = derive_categories(rec.get("categories"))
+
     paper_row = (
         entry_id, title, rec.get("authors"), rec.get("abstract"), rec.get("categories"),
         parse_dt(rec.get("published")), parse_dt(rec.get("updated")),
@@ -476,6 +616,9 @@ def parse_record(rec: dict):
         rec.get("s2_id") or None,
         rec.get("non_arxiv_citation_count"), rec.get("non_arxiv_reference_count"),
         related_arxiv_json, tsne_json,
+        # arxiv_citation_count = number of paper_citation rows this record
+        # creates (duplicates collapse via the primary key)
+        pg_text_array(category_list), primary_category, len(set(citations)),
     )
 
     # Embedding (128-D vector)
@@ -484,8 +627,6 @@ def parse_record(rec: dict):
     if embedding_vec and isinstance(embedding_vec, list):
         embedding_row = (entry_id, json.dumps(embedding_vec))
 
-    citations = [c for c in (str(x).strip() for x in (rec.get("citations") or []) if x is not None) if c]
-    references = [r for r in (str(x).strip() for x in (rec.get("references") or []) if x is not None) if r]
     return paper_row, embedding_row, citations, references
 
 
@@ -501,6 +642,7 @@ def import_dataset(filepath: str, batch_size: int = 20000):
     conn = get_connection()
     print(f"[db] Connected to {conn.dsn}")
     ensure_tables(conn)
+    require_derived_columns(conn)
 
     use_state = _has_app_state(conn)
     if not use_state:
@@ -522,6 +664,12 @@ def import_dataset(filepath: str, batch_size: int = 20000):
     offset, line_no = _load_checkpoint(conn, filepath, file_size) if use_state else (0, 0)
     if offset:
         print(f"[resume] Continuing import at line {line_no + 1:,} (byte {offset:,} of {file_size:,})")
+
+    # Only with app_state: the stored definitions are what guarantees the
+    # rebuild, even if this run is interrupted. A resumed import finds them
+    # there and keeps going without the indexes.
+    if use_state and not offset and not get_state(conn, DEFERRED_INDEXES_KEY) and _is_paper_table_empty(conn):
+        defer_secondary_indexes(conn)
 
     def flush_all():
         flush_papers(conn, paper_batch)
@@ -603,9 +751,11 @@ def import_dataset(filepath: str, batch_size: int = 20000):
     if use_state:
         _save_checkpoint(conn, filepath, file_size, offset, line_no)
 
-    refresh_derived_columns(conn)
+    reconcile_citation_counts(conn)
 
     if use_state:
+        # Before the complete marker: an import is only done once its indexes exist
+        rebuild_secondary_indexes(conn)
         set_state(conn, DATASET_IMPORT_KEY, DATASET_IMPORT_COMPLETE)
         set_state(conn, DATASET_IMPORT_OFFSET_KEY, "")
 
