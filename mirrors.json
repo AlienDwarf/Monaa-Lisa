@@ -2,6 +2,7 @@
     "files": {
         "dataset": {
             "filename": "Cleaned_Full_Dataset_With_Related.jsonl",
+            "sha256": "2ab94491270f99bb2339e8b4622104d37111dcdc85fb3e88591f7f47064468c4",
             "description": "Full arXiv dataset with embeddings and related papers",
             "mirrors": [
                 "https://monaa.shrimpshromp.eu/Cleaned_Full_Dataset_With_Related.jsonl"
@@ -12,6 +13,7 @@
         },
         "pca_model": {
             "filename": "pca_model_128d.pkl",
+            "sha256": "5b7436e92572c6e17fb6b4ed4b1d3e6532e7ec274a66e004d716e960bc3b698d",
             "description": "PCA model (768D -> 128D)",
             "mirrors": [
                 "https://monaa.shrimpshromp.eu/pca_model_128d.pkl"
@@ -22,6 +24,7 @@
         },
         "umap_model": {
             "filename": "umap_model_2d.pkl",
+            "sha256": "b2f4b0f83cc50b6fe32107f9047c72545a7a73f9ede06770e96d59fabcbc534d",
             "description": "UMAP model (128D -> 2D)",
             "mirrors": [
                 "https://monaa.shrimpshromp.eu/umap_model_2d-003.pkl"
